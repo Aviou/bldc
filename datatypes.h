@@ -1127,6 +1127,11 @@ typedef enum {
 	COMM_CAN_UPDATE_BAUD_ALL				= 158,
 
 	COMM_MOTOR_ESTOP						= 159,
+
+	// MCSA (Motor Current Signature Analysis) streaming
+	COMM_MCSA_STREAM_START					= 160,
+	COMM_MCSA_STREAM_STOP					= 161,
+	COMM_MCSA_STREAM_DATA					= 162,
 } COMM_PACKET_ID;
 
 // CAN commands

@@ -1155,6 +1155,16 @@ __attribute__((section(".text2"))) void terminal_process_string(char *str) {
 	} else if (strcmp(argv[0], "rebootwdt") == 0) {
 		chSysLock();
 		for (;;) {__NOP();}
+	} else if (strcmp(argv[0], "phase_currents") == 0) {
+		float ia, ib, ic;
+		mc_interface_get_phase_currents(&ia, &ib, &ic);
+		commands_printf("Phase currents (Amperes):");
+		commands_printf("  Ia: %.4f A", (double)ia);
+		commands_printf("  Ib: %.4f A", (double)ib);
+		commands_printf("  Ic: %.4f A", (double)ic);
+		commands_printf("  |I|: %.4f A", (double)sqrtf(ia * ia + ib * ib + ic * ic));
+		commands_printf("Sampling frequency: %.0f Hz\n",
+				(double)mcpwm_foc_get_sampling_frequency_now());
 	}
 
 	// The help command
@@ -1272,6 +1282,9 @@ __attribute__((section(".text2"))) void terminal_process_string(char *str) {
 
 		commands_printf("rebootwdt");
 		commands_printf("  Reboot using the watchdog timer.");
+
+		commands_printf("phase_currents");
+		commands_printf("  Print individual phase currents (Ia, Ib, Ic) in Amperes for MCSA.");
 
 		for (int i = 0;i < callback_write;i++) {
 			if (callbacks[i].cbf == 0) {

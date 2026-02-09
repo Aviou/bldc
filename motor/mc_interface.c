@@ -1430,6 +1430,63 @@ float mc_interface_read_reset_avg_vq(void) {
 	return DIR_MULT * res;
 }
 
+/**
+ * Get individual phase currents in Amperes for MCSA analysis.
+ *
+ * @param ia
+ * Pointer to store phase A current in Amperes.
+ *
+ * @param ib
+ * Pointer to store phase B current in Amperes.
+ *
+ * @param ic
+ * Pointer to store phase C current in Amperes.
+ */
+void mc_interface_get_phase_currents(float *ia, float *ib, float *ic) {
+	volatile mc_configuration *conf = &motor_now()->m_conf;
+
+	if (conf->motor_type == MOTOR_TYPE_FOC) {
+#ifdef HW_HAS_DUAL_MOTORS
+		bool is_second_motor = motor_now() == &m_motor_2;
+#else
+		bool is_second_motor = false;
+#endif
+		mcpwm_foc_get_currents_adc(ia, ib, ic, is_second_motor);
+		// Convert raw ADC readings to calibrated Amperes
+		if (is_second_motor) {
+			*ia = (*ia - conf->foc_offsets_current[0]) * FAC_CURRENT1_M2;
+			*ib = (*ib - conf->foc_offsets_current[1]) * FAC_CURRENT2_M2;
+			*ic = (*ic - conf->foc_offsets_current[2]) * FAC_CURRENT3_M2;
+		} else {
+			*ia = (*ia - conf->foc_offsets_current[0]) * FAC_CURRENT1;
+			*ib = (*ib - conf->foc_offsets_current[1]) * FAC_CURRENT2;
+			*ic = (*ic - conf->foc_offsets_current[2]) * FAC_CURRENT3;
+		}
+	} else {
+		*ia = 0.0;
+		*ib = 0.0;
+		*ic = 0.0;
+	}
+}
+
+float mc_interface_get_phase_current_a(void) {
+	float ia, ib, ic;
+	mc_interface_get_phase_currents(&ia, &ib, &ic);
+	return ia;
+}
+
+float mc_interface_get_phase_current_b(void) {
+	float ia, ib, ic;
+	mc_interface_get_phase_currents(&ia, &ib, &ic);
+	return ib;
+}
+
+float mc_interface_get_phase_current_c(void) {
+	float ia, ib, ic;
+	mc_interface_get_phase_currents(&ia, &ib, &ic);
+	return ic;
+}
+
 float mc_interface_get_pid_pos_set(void) {
 	return motor_now()->m_position_set;
 }

@@ -71,6 +71,12 @@ static THD_FUNCTION(blocking_thread, arg);
 static THD_WORKING_AREA(blocking_thread_wa, 3000);
 static thread_t *blocking_tp;
 
+static THD_FUNCTION(mcsa_stream_thread, arg);
+static THD_WORKING_AREA(mcsa_stream_thread_wa, 1024);
+static thread_t *mcsa_stream_tp = NULL;
+static volatile bool mcsa_stream_running = false;
+static volatile uint16_t mcsa_stream_interval_us = 50;
+
 // Private variables
 static char print_buffer[PRINT_BUFFER_SIZE];
 static uint8_t blocking_thread_cmd_buffer[PACKET_MAX_PL_LEN];
@@ -94,6 +100,7 @@ void commands_init(void) {
 	chMtxObjectInit(&print_mutex);
 	chMtxObjectInit(&terminal_mutex);
 	chThdCreateStatic(blocking_thread_wa, sizeof(blocking_thread_wa), NORMALPRIO, blocking_thread, NULL);
+	chThdCreateStatic(mcsa_stream_thread_wa, sizeof(mcsa_stream_thread_wa), NORMALPRIO - 1, mcsa_stream_thread, NULL);
 	is_initialized = true;
 }
 
@@ -476,6 +483,13 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 			status |= timeout_has_timeout();
 			status |= timeout_kill_sw_active() << 1;
 			send_buffer[ind++] = status;
+		}
+		if (mask & ((uint32_t)1 << 22)) {
+			float ia, ib, ic;
+			mc_interface_get_phase_currents(&ia, &ib, &ic);
+			buffer_append_float32(send_buffer, ia, 1e3, &ind);
+			buffer_append_float32(send_buffer, ib, 1e3, &ind);
+			buffer_append_float32(send_buffer, ic, 1e3, &ind);
 		}
 
 		reply_func(send_buffer, ind);
@@ -1651,6 +1665,20 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		mc_interface_release_motor_override_both();
 	} break;
 
+	case COMM_MCSA_STREAM_START: {
+		int32_t ind = 0;
+		mcsa_stream_interval_us = buffer_get_uint16(data, &ind);
+		if (mcsa_stream_interval_us < 50) {
+			mcsa_stream_interval_us = 50;  // Min 50us = 20kHz max
+		}
+		mcsa_stream_running = true;
+		chEvtSignal(mcsa_stream_tp, (eventmask_t) 1);
+	} break;
+
+	case COMM_MCSA_STREAM_STOP: {
+		mcsa_stream_running = false;
+	} break;
+
 	// Blocking commands. Only one of them runs at any given time, in their
 	// own thread. If other blocking commands come before the previous one has
 	// finished, they are discarded.
@@ -2015,6 +2043,32 @@ void commands_send_plot_points(float x, float y) {
 
 int commands_get_fw_version_sent_cnt(void) {
 	return fw_version_sent_cnt;
+}
+
+static THD_FUNCTION(mcsa_stream_thread, arg) {
+	(void)arg;
+
+	chRegSetThreadName("mcsa_stream");
+	mcsa_stream_tp = chThdGetSelfX();
+
+	for (;;) {
+		chEvtWaitAny((eventmask_t) 1);
+
+		while (mcsa_stream_running) {
+			float ia, ib, ic;
+			mc_interface_get_phase_currents(&ia, &ib, &ic);
+
+			int32_t ind = 0;
+			uint8_t buffer[20];
+			buffer[ind++] = COMM_MCSA_STREAM_DATA;
+			buffer_append_float32(buffer, ia, 1e3, &ind);
+			buffer_append_float32(buffer, ib, 1e3, &ind);
+			buffer_append_float32(buffer, ic, 1e3, &ind);
+			commands_send_packet(buffer, ind);
+
+			chThdSleepMicroseconds(mcsa_stream_interval_us);
+		}
+	}
 }
 
 static THD_FUNCTION(blocking_thread, arg) {
