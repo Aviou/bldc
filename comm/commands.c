@@ -72,10 +72,9 @@ static THD_WORKING_AREA(blocking_thread_wa, 3000);
 static thread_t *blocking_tp;
 
 static THD_FUNCTION(mcsa_stream_thread, arg);
-static THD_WORKING_AREA(mcsa_stream_thread_wa, 1024);
+static THD_WORKING_AREA(mcsa_stream_thread_wa, 2048);
 static thread_t *mcsa_stream_tp = NULL;
 static volatile bool mcsa_stream_running = false;
-static volatile uint16_t mcsa_stream_interval_us = 50;
 
 // Private variables
 static char print_buffer[PRINT_BUFFER_SIZE];
@@ -1666,11 +1665,6 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 	} break;
 
 	case COMM_MCSA_STREAM_START: {
-		int32_t ind = 0;
-		mcsa_stream_interval_us = buffer_get_uint16(data, &ind);
-		if (mcsa_stream_interval_us < 50) {
-			mcsa_stream_interval_us = 50;  // Min 50us = 20kHz max
-		}
 		mcsa_stream_running = true;
 		chEvtSignal(mcsa_stream_tp, (eventmask_t) 1);
 	} break;
@@ -2051,23 +2045,42 @@ static THD_FUNCTION(mcsa_stream_thread, arg) {
 	chRegSetThreadName("mcsa_stream");
 	mcsa_stream_tp = chThdGetSelfX();
 
+	// Batch buffer: max 32 samples per packet
+	// Packet: [CMD 1B][sample_cnt 4B][sample_rate 4B][num_samples 1B][N * 12B]
+	// Max: 1 + 4 + 4 + 1 + 32*12 = 394 bytes < 512 (PACKET_MAX_PL_LEN)
+	#define MCSA_BATCH_SIZE 32
+	mcsa_sample_t batch[MCSA_BATCH_SIZE];
+
 	for (;;) {
 		chEvtWaitAny((eventmask_t) 1);
 
+		mcpwm_foc_mcsa_start();
+
 		while (mcsa_stream_running) {
-			float ia, ib, ic;
-			mc_interface_get_phase_currents(&ia, &ib, &ic);
+			uint32_t sample_cnt;
+			int n = mcpwm_foc_mcsa_read(batch, MCSA_BATCH_SIZE, &sample_cnt);
 
-			int32_t ind = 0;
-			uint8_t buffer[20];
-			buffer[ind++] = COMM_MCSA_STREAM_DATA;
-			buffer_append_float32(buffer, ia, 1e3, &ind);
-			buffer_append_float32(buffer, ib, 1e3, &ind);
-			buffer_append_float32(buffer, ic, 1e3, &ind);
-			commands_send_packet(buffer, ind);
+			if (n > 0) {
+				int32_t ind = 0;
+				uint8_t buffer[10 + MCSA_BATCH_SIZE * 12];
+				buffer[ind++] = COMM_MCSA_STREAM_DATA;
+				buffer_append_uint32(buffer, sample_cnt - (uint32_t)n, &ind);
+				buffer_append_float32_auto(buffer, mcpwm_foc_get_sampling_frequency_now(), &ind);
+				buffer[ind++] = (uint8_t)n;
 
-			chThdSleepMicroseconds(mcsa_stream_interval_us);
+				for (int i = 0; i < n; i++) {
+					buffer_append_float32(buffer, batch[i].ia, 1e3, &ind);
+					buffer_append_float32(buffer, batch[i].ib, 1e3, &ind);
+					buffer_append_float32(buffer, batch[i].ic, 1e3, &ind);
+				}
+
+				commands_send_packet(buffer, ind);
+			} else {
+				chThdSleepMilliseconds(1);
+			}
 		}
+
+		mcpwm_foc_mcsa_stop();
 	}
 }
 

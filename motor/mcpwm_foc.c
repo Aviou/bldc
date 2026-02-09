@@ -51,6 +51,13 @@ static volatile motor_all_state_t m_motor_2;
 #endif
 static volatile int m_isr_motor = 0;
 
+// MCSA ring buffer (single-producer ISR, single-consumer thread)
+static volatile mcsa_sample_t mcsa_buffer[MCSA_BUF_SIZE];
+static volatile uint32_t mcsa_write_idx = 0;
+static volatile uint32_t mcsa_read_idx = 0;
+static volatile uint32_t mcsa_sample_cnt = 0;
+static volatile bool mcsa_capture_active = false;
+
 // Private functions
 static void control_current(motor_all_state_t *motor, float dt);
 static void update_valpha_vbeta(motor_all_state_t *motor, float mod_alpha, float mod_beta, float voltage_normalize);
@@ -2845,6 +2852,55 @@ void mcpwm_foc_tim_sample_int_handler(void) {
 	}
 }
 
+// MCSA synchronous sampling API
+
+void mcpwm_foc_mcsa_start(void) {
+	mcsa_read_idx = 0;
+	mcsa_write_idx = 0;
+	mcsa_sample_cnt = 0;
+	mcsa_capture_active = true;
+}
+
+void mcpwm_foc_mcsa_stop(void) {
+	mcsa_capture_active = false;
+}
+
+bool mcpwm_foc_mcsa_is_active(void) {
+	return mcsa_capture_active;
+}
+
+int mcpwm_foc_mcsa_read(mcsa_sample_t *out, int max_samples, uint32_t *sample_cnt) {
+	uint32_t ri = mcsa_read_idx;
+	uint32_t wi = mcsa_write_idx;
+	uint32_t available = (wi - ri) & (MCSA_BUF_SIZE - 1);
+
+	if (available == 0) {
+		if (sample_cnt) {
+			*sample_cnt = mcsa_sample_cnt;
+		}
+		return 0;
+	}
+
+	int n = (int)available;
+	if (n > max_samples) {
+		n = max_samples;
+	}
+
+	for (int i = 0; i < n; i++) {
+		uint32_t idx = (ri + i) & (MCSA_BUF_SIZE - 1);
+		out[i].ia = mcsa_buffer[idx].ia;
+		out[i].ib = mcsa_buffer[idx].ib;
+		out[i].ic = mcsa_buffer[idx].ic;
+	}
+
+	mcsa_read_idx = (ri + n) & (MCSA_BUF_SIZE - 1);
+
+	if (sample_cnt) {
+		*sample_cnt = mcsa_sample_cnt;
+	}
+	return n;
+}
+
 void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 	(void)p;
 	(void)flags;
@@ -3223,6 +3279,16 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 	float ia = curr0;
 	float ib = curr1;
 	float ic = curr2;
+
+	// MCSA: Store synchronized phase current sample in ring buffer
+	if (mcsa_capture_active && !is_second_motor) {
+		uint32_t wi = mcsa_write_idx;
+		mcsa_buffer[wi].ia = ia;
+		mcsa_buffer[wi].ib = ib;
+		mcsa_buffer[wi].ic = ic;
+		mcsa_write_idx = (wi + 1) & (MCSA_BUF_SIZE - 1);
+		mcsa_sample_cnt++;
+	}
 
 	UTILS_LP_FAST(state_now->v_bus, GET_INPUT_VOLTAGE(), 0.1);
 

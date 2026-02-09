@@ -149,6 +149,20 @@ float mcpwm_foc_get_abs_motor_current_motor(bool is_second_motor);
 float mcpwm_foc_get_abs_motor_current_filtered_motor(bool is_second_motor);
 mc_state mcpwm_foc_get_state_motor(bool is_second_motor);
 
+// MCSA (Motor Current Signature Analysis) synchronous sampling
+#define MCSA_BUF_SIZE		1024
+
+typedef struct {
+	float ia;
+	float ib;
+	float ic;
+} mcsa_sample_t;
+
+void mcpwm_foc_mcsa_start(void);
+void mcpwm_foc_mcsa_stop(void);
+bool mcpwm_foc_mcsa_is_active(void);
+int mcpwm_foc_mcsa_read(mcsa_sample_t *out, int max_samples, uint32_t *sample_cnt);
+
 // Interrupt handlers
 void mcpwm_foc_tim_sample_int_handler(void);
 void mcpwm_foc_adc_int_handler(void *p, uint32_t flags);
