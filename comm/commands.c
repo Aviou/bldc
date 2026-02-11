@@ -2068,10 +2068,16 @@ static THD_FUNCTION(mcsa_stream_thread, arg) {
 				buffer_append_float32_auto(buffer, mcpwm_foc_get_sampling_frequency_now(), &ind);
 				buffer[ind++] = (uint8_t)n;
 
+				// Send grouped by phase: all ia, then all ib, then all ic
+				// Use float32_auto (IEEE 754) for correct Python struct.unpack('!f')
 				for (int i = 0; i < n; i++) {
-					buffer_append_float32(buffer, batch[i].ia, 1e3, &ind);
-					buffer_append_float32(buffer, batch[i].ib, 1e3, &ind);
-					buffer_append_float32(buffer, batch[i].ic, 1e3, &ind);
+					buffer_append_float32_auto(buffer, batch[i].ia, &ind);
+				}
+				for (int i = 0; i < n; i++) {
+					buffer_append_float32_auto(buffer, batch[i].ib, &ind);
+				}
+				for (int i = 0; i < n; i++) {
+					buffer_append_float32_auto(buffer, batch[i].ic, &ind);
 				}
 
 				commands_send_packet(buffer, ind);
