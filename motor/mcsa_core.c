@@ -109,6 +109,71 @@ static uint8_t channel_count(uint16_t mask) {
 	return n;
 }
 
+static void put_u8(uint8_t *b, int32_t *i, uint8_t v) {
+	b[(*i)++] = v;
+}
+
+static void put_u16(uint8_t *b, int32_t *i, uint16_t v) {
+	b[(*i)++] = (uint8_t)(v >> 8);
+	b[(*i)++] = (uint8_t)v;
+}
+
+static void put_u32(uint8_t *b, int32_t *i, uint32_t v) {
+	b[(*i)++] = (uint8_t)(v >> 24);
+	b[(*i)++] = (uint8_t)(v >> 16);
+	b[(*i)++] = (uint8_t)(v >> 8);
+	b[(*i)++] = (uint8_t)v;
+}
+
+static void put_i64(uint8_t *b, int32_t *i, int64_t v) {
+	uint64_t u = (uint64_t)v;
+	for (int s = 56; s >= 0; s -= 8) {
+		b[(*i)++] = (uint8_t)(u >> s);
+	}
+}
+
+static void put_f32(uint8_t *b, int32_t *i, float f) {
+	uint32_t u;
+	memcpy(&u, &f, sizeof(u));
+	put_u32(b, i, u);
+}
+
+static uint16_t get_u16(const uint8_t *b) {
+	return (uint16_t)(((uint16_t)b[0] << 8) | b[1]);
+}
+
+static uint32_t get_u32(const uint8_t *b) {
+	return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+}
+
+static void lock_isr(const mcsa_env *env) {
+	if (env->lock_isr) {
+		env->lock_isr();
+	}
+}
+
+static void unlock_isr(const mcsa_env *env) {
+	if (env->unlock_isr) {
+		env->unlock_isr();
+	}
+}
+
+static uint32_t oldest_index(uint32_t n_written, uint32_t capacity) {
+	return n_written >= capacity ? n_written - capacity : 0;
+}
+
+static int32_t put_hdr(const mcsa_core *c, const mcsa_env *env, uint8_t *r, uint8_t cmd, mcsa_status st) {
+	int32_t i = 0;
+	put_u8(r, &i, MCSA_MAGIC0);
+	put_u8(r, &i, MCSA_MAGIC1);
+	put_u8(r, &i, MCSA_PROTO_VERSION);
+	put_u8(r, &i, (uint8_t)(cmd | 0x80u));
+	put_u8(r, &i, (uint8_t)st);
+	put_u16(r, &i, c->session);
+	put_u32(r, &i, env->uptime_ms);
+	return i;
+}
+
 uint16_t mcsa_crc16(const uint8_t *buf, uint32_t len) {
 	uint16_t crc = 0;
 
@@ -441,5 +506,231 @@ void mcsa_core_isr_end(mcsa_core *c, float isr_duration) {
 			c->isr_max_idle_win = 0.0f;
 			c->isr_idle_cnt = 0;
 		}
+	}
+}
+
+uint32_t mcsa_core_max_records_per_read(uint32_t resp_max, uint8_t rec_bytes) {
+	if (rec_bytes == 0 || resp_max <= MCSA_READ_OVERHEAD) {
+		return 0;
+	}
+	uint32_t n = (resp_max - MCSA_READ_OVERHEAD) / rec_bytes;
+	return n > 0xFFFFu ? 0xFFFFu : n;
+}
+
+static int cmd_info(mcsa_core *c, const mcsa_env *env, uint8_t *r) {
+	int32_t i = put_hdr(c, env, r, MCSA_CMD_INFO, MCSA_OK);
+	put_u8(r, &i, MCSA_PROTO_VERSION);
+	put_u8(r, &i, MCSA_CIC_ORDER);
+	put_u8(r, &i, MCSA_R_MAX);
+	put_u8(r, &i, env->pole_pairs);
+	put_u32(r, &i, c->buf_words * 2);
+	put_f32(r, &i, env->f_isr);
+	put_f32(r, &i, env->fac_current);
+
+	bool end = env->git_hash == 0;
+	for (int k = 0; k < MCSA_GIT_HASH_LEN; k++) {
+		char ch = end ? 0 : env->git_hash[k];
+		if (ch == 0) {
+			end = true;
+		}
+		put_u8(r, &i, (uint8_t)ch);
+	}
+	return i;
+}
+
+static int cmd_start(mcsa_core *c, const mcsa_env *env, const uint8_t *a, uint32_t alen, uint8_t *r) {
+	if (alen < 10) {
+		return put_hdr(c, env, r, MCSA_CMD_START, MCSA_BAD_ARG);
+	}
+
+	mcsa_status st = mcsa_core_start(c, env, a[0], get_u16(a + 1), a[3], get_u32(a + 4), get_u16(a + 8));
+	int32_t i = put_hdr(c, env, r, MCSA_CMD_START, st);
+	if (st == MCSA_OK) {
+		put_u32(r, &i, c->capacity);
+		put_u8(r, &i, (uint8_t)(2 * c->nch));
+		put_u16(r, &i, c->mask);
+		put_u8(r, &i, (uint8_t)c->R);
+	}
+	return i;
+}
+
+static int cmd_stop(mcsa_core *c, const mcsa_env *env, const uint8_t *a, uint32_t alen, uint8_t *r) {
+	if (alen < 2) {
+		return put_hdr(c, env, r, MCSA_CMD_STOP, MCSA_BAD_ARG);
+	}
+
+	mcsa_status st = MCSA_OK;
+	lock_isr(env);
+	if (get_u16(a) != c->session || c->state == MCSA_STATE_IDLE) {
+		st = MCSA_NOT_AVAILABLE;
+	} else {
+		mcsa_core_stop(c, MCSA_STOP_CMD);
+	}
+	uint32_t nw = c->n_written;
+	uint8_t reason = c->stop_reason;
+	unlock_isr(env);
+
+	int32_t i = put_hdr(c, env, r, MCSA_CMD_STOP, st);
+	put_u32(r, &i, nw);
+	put_u8(r, &i, reason);
+	return i;
+}
+
+static int cmd_status(mcsa_core *c, const mcsa_env *env, uint8_t *r) {
+	lock_isr(env);
+	mcsa_state state = c->state;
+	uint8_t reason = c->stop_reason;
+	uint32_t nw = c->n_written;
+	int64_t theta_start = c->theta_start;
+	float isr_idle = c->isr_max_idle;
+	float isr_capture = c->isr_max_capture;
+	uint32_t saturated = c->saturated;
+	unlock_isr(env);
+
+	bool idle = state == MCSA_STATE_IDLE;
+	int32_t i = put_hdr(c, env, r, MCSA_CMD_STATUS, MCSA_OK);
+	put_u8(r, &i, (uint8_t)state);
+	put_u8(r, &i, reason);
+	put_u8(r, &i, c->mode);
+	put_u16(r, &i, c->mask);
+	put_u8(r, &i, (uint8_t)c->R);
+	put_u8(r, &i, MCSA_CIC_ORDER);
+	put_u8(r, &i, env->pole_pairs);
+	put_u32(r, &i, c->capacity);
+	put_u32(r, &i, c->length);
+	put_u32(r, &i, nw);
+	put_u32(r, &i, oldest_index(nw, c->capacity));
+	put_f32(r, &i, idle ? env->f_isr : c->f_isr);
+	put_f32(r, &i, (idle ? env->fac_current : c->fac_current) / 8.0f);
+	for (int k = 0; k < 3; k++) {
+		put_f32(r, &i, c->off_frozen[k]);
+	}
+	put_i64(r, &i, theta_start);
+	put_f32(r, &i, isr_idle * 1.0e6f);
+	put_f32(r, &i, isr_capture * 1.0e6f);
+	put_u32(r, &i, saturated);
+	return i;
+}
+
+static int read_error(mcsa_core *c, const mcsa_env *env, uint8_t *r, mcsa_status st,
+		uint32_t nw) {
+	int32_t i = put_hdr(c, env, r, MCSA_CMD_READ, st);
+	put_u32(r, &i, oldest_index(nw, c->capacity));
+	put_u32(r, &i, nw);
+	return i;
+}
+
+static int cmd_read(mcsa_core *c, const mcsa_env *env, const uint8_t *a, uint32_t alen,
+		uint8_t *r, uint32_t resp_max) {
+	if (alen < 8) {
+		return put_hdr(c, env, r, MCSA_CMD_READ, MCSA_BAD_ARG);
+	}
+
+	uint16_t session = get_u16(a);
+	uint32_t start = get_u32(a + 2);
+	uint16_t count = get_u16(a + 6);
+
+	lock_isr(env);
+	mcsa_state state = c->state;
+	uint32_t nw = c->n_written;
+	int64_t newest_angle = c->last_angle_q13;
+	unlock_isr(env);
+
+	const uint32_t cap = c->capacity;
+	if (state == MCSA_STATE_IDLE || state == MCSA_STATE_INVALID || session != c->session || start > nw) {
+		return read_error(c, env, r, MCSA_NOT_AVAILABLE, nw);
+	}
+	if (nw - start > cap) {
+		return read_error(c, env, r, MCSA_OVERWRITTEN, nw);
+	}
+
+	const uint8_t rec_bytes = (uint8_t)(2 * c->nch);
+	uint32_t n = nw - start;
+	uint32_t max_n = mcsa_core_max_records_per_read(resp_max, rec_bytes);
+	if (n > count) {
+		n = count;
+	}
+	if (n > max_n) {
+		n = max_n;
+	}
+
+	int32_t i = put_hdr(c, env, r, MCSA_CMD_READ, MCSA_OK);
+	put_u32(r, &i, start);
+	put_u16(r, &i, (uint16_t)n);
+	put_u8(r, &i, rec_bytes);
+	int32_t anchor_pos = i;
+	put_i64(r, &i, 0);
+	int32_t data_pos = i;
+
+	for (uint32_t k = 0; k < n; k++) {
+		volatile int16_t *rec = c->buf + ((start + k) % cap) * c->nch;
+		for (uint8_t ch = 0; ch < c->nch; ch++) {
+			put_u16(r, &i, (uint16_t)rec[ch]);
+		}
+	}
+
+	// Angle anchor: unwind from the newest record back to `start`
+	int64_t anchor = 0;
+	if (n > 0 && c->angle_pos != MCSA_ANGLE_NONE) {
+		anchor = newest_angle;
+		uint32_t idx = nw - 1;
+		uint16_t later = (uint16_t)c->buf[(idx % cap) * c->nch + c->angle_pos];
+		while (idx > start) {
+			idx--;
+			uint16_t earlier = (uint16_t)c->buf[(idx % cap) * c->nch + c->angle_pos];
+			anchor -= (int16_t)(uint16_t)(later - earlier);
+			later = earlier;
+		}
+	}
+
+	if (env->read_copy_hook) {
+		env->read_copy_hook(env->read_copy_hook_arg);
+	}
+
+	lock_isr(env);
+	uint32_t nw2 = c->n_written;
+	unlock_isr(env);
+	if (nw2 - start > cap) {
+		return read_error(c, env, r, MCSA_OVERWRITTEN, nw2);
+	}
+
+	put_i64(r, &anchor_pos, anchor);
+	put_u16(r, &i, mcsa_crc16(r + data_pos, (uint32_t)(i - data_pos)));
+	return i;
+}
+
+int mcsa_core_process(mcsa_core *c, const mcsa_env *env, const uint8_t *req, uint32_t len,
+		uint8_t *resp, uint32_t resp_max) {
+	if (len < 2 || req[0] != MCSA_MAGIC0 || req[1] != MCSA_MAGIC1) {
+		return 0;
+	}
+	if (resp_max < MCSA_RESP_MIN) {
+		return -1;
+	}
+
+	uint8_t cmd = len >= 4 ? req[3] : 0;
+	if (len < 4) {
+		return put_hdr(c, env, resp, cmd, MCSA_BAD_ARG);
+	}
+	if (req[2] != MCSA_PROTO_VERSION) {
+		return put_hdr(c, env, resp, cmd, MCSA_BAD_VERSION);
+	}
+
+	const uint8_t *a = req + 4;
+	uint32_t alen = len - 4;
+
+	switch (cmd) {
+	case MCSA_CMD_INFO:
+		return cmd_info(c, env, resp);
+	case MCSA_CMD_START:
+		return cmd_start(c, env, a, alen, resp);
+	case MCSA_CMD_STOP:
+		return cmd_stop(c, env, a, alen, resp);
+	case MCSA_CMD_STATUS:
+		return cmd_status(c, env, resp);
+	case MCSA_CMD_READ:
+		return cmd_read(c, env, a, alen, resp, resp_max);
+	default:
+		return put_hdr(c, env, resp, cmd, MCSA_UNKNOWN_CMD);
 	}
 }

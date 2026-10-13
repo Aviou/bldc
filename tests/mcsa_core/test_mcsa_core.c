@@ -548,6 +548,296 @@ static void test_isr_timing(void) {
 	CHECK(!c.sampled_this_isr);
 }
 
+// ---------------- Task 3 ----------------
+
+static uint32_t req(uint8_t *b, uint8_t cmd, const uint8_t *args, uint32_t alen) {
+	b[0] = MCSA_MAGIC0;
+	b[1] = MCSA_MAGIC1;
+	b[2] = MCSA_PROTO_VERSION;
+	b[3] = cmd;
+	if (alen > 0) {
+		memcpy(b + 4, args, alen);
+	}
+	return 4 + alen;
+}
+
+static uint16_t be16(const uint8_t *p) {
+	return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+static uint32_t be32(const uint8_t *p) {
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static int64_t be64(const uint8_t *p) {
+	uint64_t v = 0;
+	for (int i = 0; i < 8; i++) {
+		v = (v << 8) | p[i];
+	}
+	return (int64_t)v;
+}
+
+static float bef(const uint8_t *p) {
+	uint32_t u = be32(p);
+	float f;
+	memcpy(&f, &u, sizeof(f));
+	return f;
+}
+
+static int process(mcsa_core *c, mcsa_env *e, const uint8_t *rq, uint32_t len, uint8_t *resp) {
+	return mcsa_core_process(c, e, rq, len, resp, RESP_MAX);
+}
+
+static void build_read(uint8_t *rq, uint32_t *l, uint16_t session, uint32_t start, uint16_t count) {
+	uint8_t a[8] = {
+		(uint8_t)(session >> 8), (uint8_t)session,
+		(uint8_t)(start >> 24), (uint8_t)(start >> 16), (uint8_t)(start >> 8), (uint8_t)start,
+		(uint8_t)(count >> 8), (uint8_t)count
+	};
+	*l = req(rq, MCSA_CMD_READ, a, 8);
+}
+
+typedef struct {
+	mcsa_core *c;
+	sim_t *s;
+	uint32_t n;
+} hook_ctx;
+
+static void hook_feed(void *arg) {
+	hook_ctx *h = (hook_ctx *)arg;
+	sim_run(h->c, h->s, h->n);
+}
+
+static void test_protocol_framing(void) {
+	mcsa_core c;
+	new_core(&c, BUF_BYTES);
+	mcsa_env e = test_env();
+	uint8_t rq[64];
+	uint8_t rs[RESP_MAX];
+
+	// Other app data is not ours
+	const uint8_t other[4] = {0x12, 0x34, 1, 1};
+	CHECK_EQ(process(&c, &e, other, 4, rs), 0);
+	rq[0] = MCSA_MAGIC0;
+	CHECK_EQ(process(&c, &e, rq, 1, rs), 0);
+
+	// Our magic but too short
+	rq[1] = MCSA_MAGIC1;
+	rq[2] = MCSA_PROTO_VERSION;
+	int n = process(&c, &e, rq, 3, rs);
+	CHECK_EQ(n, MCSA_RESP_HDR_LEN);
+	CHECK_EQ(rs[3], 0x80);
+	CHECK_EQ(rs[4], MCSA_BAD_ARG);
+
+	// Wrong version
+	uint32_t l = req(rq, MCSA_CMD_INFO, NULL, 0);
+	rq[2] = 2;
+	process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_BAD_VERSION);
+
+	// Unknown command
+	l = req(rq, 9, NULL, 0);
+	process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[3], 0x89);
+	CHECK_EQ(rs[4], MCSA_UNKNOWN_CMD);
+
+	// Header carries session and uptime
+	CHECK_EQ(rs[0], MCSA_MAGIC0);
+	CHECK_EQ(rs[1], MCSA_MAGIC1);
+	CHECK_EQ(rs[2], MCSA_PROTO_VERSION);
+	CHECK_EQ(be16(rs + 5), 0);
+	CHECK_EQ(be32(rs + 7), 1234);
+
+	// Too small response buffer: consumed, no answer
+	l = req(rq, MCSA_CMD_INFO, NULL, 0);
+	CHECK(mcsa_core_process(&c, &e, rq, l, rs, 20) < 0);
+}
+
+static void test_protocol_info(void) {
+	mcsa_core c;
+	new_core(&c, BUF_BYTES);
+	mcsa_env e = test_env();
+	uint8_t rq[64];
+	uint8_t rs[RESP_MAX];
+
+	uint32_t l = req(rq, MCSA_CMD_INFO, NULL, 0);
+	int n = process(&c, &e, rq, l, rs);
+	CHECK_EQ(n, MCSA_RESP_HDR_LEN + 32);
+	CHECK_EQ(rs[4], MCSA_OK);
+	const uint8_t *b = rs + MCSA_RESP_HDR_LEN;
+	CHECK_EQ(b[0], 1);
+	CHECK_EQ(b[1], 3);
+	CHECK_EQ(b[2], 64);
+	CHECK_EQ(b[3], 7);
+	CHECK_EQ(be32(b + 4), BUF_BYTES);
+	CHECK_NEAR(bef(b + 8), 30000.0, 0.0);
+	CHECK_NEAR(bef(b + 12), FAC_CUR, 0.0);
+	CHECK(memcmp(b + 16, "abc1234-dirty\0\0\0", 16) == 0);
+}
+
+static void test_protocol_start_status_stop(void) {
+	mcsa_core c;
+	new_core(&c, BUF_BYTES);
+	mcsa_env e = test_env();
+	sim_t s = sim_default();
+	s.offset[0] = 2047.5f;
+	uint8_t rq[64];
+	uint8_t rs[RESP_MAX];
+
+	const uint8_t a[10] = {MCSA_MODE_CONTINUOUS, 0x00, 0x87, 10, 0, 0, 0, 0, 0x12, 0x34};
+	uint32_t l = req(rq, MCSA_CMD_START, a, 10);
+	int n = process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_OK);
+	CHECK_EQ(be16(rs + 5), 1);
+	CHECK_EQ(n, MCSA_RESP_HDR_LEN + 8);
+	CHECK_EQ(be32(rs + 11), 5000);
+	CHECK_EQ(rs[15], 8);
+	CHECK_EQ(be16(rs + 16), 0x0087);
+	CHECK_EQ(rs[18], 10);
+
+	l = req(rq, MCSA_CMD_START, a, 9);
+	n = process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_BAD_ARG);
+	CHECK_EQ(n, MCSA_RESP_HDR_LEN);
+
+	sim_run(&c, &s, 1000);	// 100 outputs, 98 stored
+
+	l = req(rq, MCSA_CMD_STATUS, NULL, 0);
+	n = process(&c, &e, rq, l, rs);
+	CHECK_EQ(n, MCSA_RESP_HDR_LEN + 64);
+	const uint8_t *b = rs + MCSA_RESP_HDR_LEN;
+	CHECK_EQ(b[0], MCSA_STATE_RUNNING);
+	CHECK_EQ(b[1], MCSA_STOP_NONE);
+	CHECK_EQ(b[2], MCSA_MODE_CONTINUOUS);
+	CHECK_EQ(be16(b + 3), 0x0087);
+	CHECK_EQ(b[5], 10);
+	CHECK_EQ(b[6], 3);
+	CHECK_EQ(b[7], 7);
+	CHECK_EQ(be32(b + 8), 5000);
+	CHECK_EQ(be32(b + 12), 0);
+	CHECK_EQ(be32(b + 16), 98);
+	CHECK_EQ(be32(b + 20), 0);
+	CHECK_NEAR(bef(b + 24), 30000.0, 0.0);
+	CHECK_NEAR(bef(b + 28), (double)FAC_CUR / 8.0, 1e-9);
+	CHECK_NEAR(bef(b + 32), 2047.5, 0.0);
+	CHECK_NEAR(bef(b + 36), 2048.0, 0.0);
+	CHECK_NEAR(bef(b + 40), 2048.0, 0.0);
+	CHECK_EQ(be64(b + 44), c.theta_start);
+	CHECK_NEAR(bef(b + 52), 0.0, 1e-9);
+	CHECK_NEAR(bef(b + 56), 10.0, 1e-3);
+	CHECK_EQ(be32(b + 60), 0);
+
+	// STOP with a foreign session
+	uint8_t sa[2] = {0, 5};
+	l = req(rq, MCSA_CMD_STOP, sa, 2);
+	n = process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_NOT_AVAILABLE);
+	CHECK_EQ(n, MCSA_RESP_HDR_LEN + 5);
+	CHECK(mcsa_core_running(&c));
+
+	sa[1] = 1;
+	l = req(rq, MCSA_CMD_STOP, sa, 2);
+	process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_OK);
+	CHECK_EQ(be32(rs + 11), 98);
+	CHECK_EQ(rs[15], MCSA_STOP_CMD);
+	CHECK_EQ(c.state, MCSA_STATE_DONE);
+}
+
+static void test_protocol_read(void) {
+	mcsa_core c;
+	new_core(&c, 800);
+	mcsa_env e = test_env();
+	sim_t s = sim_default();
+	s.ramp = true;
+	s.offset[0] = 2000.0f;
+	s.f_e = 300.0;
+	uint8_t rq[64];
+	uint8_t rs[RESP_MAX];
+	uint32_t l;
+	int n;
+
+	// Before any capture
+	build_read(rq, &l, 0, 0, 10);
+	n = process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_NOT_AVAILABLE);
+	CHECK_EQ(n, MCSA_RESP_HDR_LEN + 8);
+
+	start_ok(&c, MCSA_MODE_CONTINUOUS, 0x0087, 1, 0);	// Capacity 100
+	CHECK_EQ(mcsa_core_max_records_per_read(RESP_MAX, 8), 60);
+	sim_run(&c, &s, 82);								// 80 records
+
+	// Too short
+	build_read(rq, &l, 1, 0, 10);
+	process(&c, &e, rq, l - 1, rs);
+	CHECK_EQ(rs[4], MCSA_BAD_ARG);
+
+	// Foreign session
+	build_read(rq, &l, 2, 0, 10);
+	process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_NOT_AVAILABLE);
+	CHECK_EQ(be32(rs + 11), 0);
+	CHECK_EQ(be32(rs + 15), 80);
+
+	// Nothing new at the end
+	build_read(rq, &l, 1, 80, 10);
+	n = process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_OK);
+	CHECK_EQ(be16(rs + 15), 0);
+	CHECK_EQ(n, MCSA_READ_OVERHEAD);
+
+	// Beyond the end
+	build_read(rq, &l, 1, 81, 10);
+	process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_NOT_AVAILABLE);
+
+	// Normal read, limited to 60 records
+	build_read(rq, &l, 1, 5, 0xFFFF);
+	n = process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_OK);
+	CHECK_EQ(be32(rs + 11), 5);
+	CHECK_EQ(be16(rs + 15), 60);
+	CHECK_EQ(rs[17], 8);
+	CHECK_EQ(n, MCSA_READ_OVERHEAD + 60 * 8);
+	const uint8_t *d = rs + 26;
+	for (int r = 0; r < 60; r++) {
+		CHECK_EQ((int16_t)be16(d + r * 8), 8 * (5 + r + 2));
+	}
+	CHECK_EQ(be16(rs + 26 + 480), mcsa_crc16(d, 480));
+
+	// Anchor is the unwrapped angle of record 5
+	static int64_t ang[80];
+	unwrap_from_start(&c, 3, 80, ang);
+	CHECK_EQ(be64(rs + 18), ang[5]);
+	CHECK_EQ(be16(d + 6), (uint16_t)(ang[5] & 0xFFFF));
+
+	// Ring overrun: records before n_written - capacity are gone
+	sim_run(&c, &s, 100);			// 180 records, oldest 80
+	build_read(rq, &l, 1, 50, 10);
+	n = process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_OVERWRITTEN);
+	CHECK_EQ(n, MCSA_RESP_HDR_LEN + 8);
+	CHECK_EQ(be32(rs + 11), 80);
+	CHECK_EQ(be32(rs + 15), 180);
+
+	// The anchor after the overrun still matches the continuous angle
+	build_read(rq, &l, 1, 150, 10);
+	process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_OK);
+	double t_c = 150.0 + 2.0;
+	double expected = (double)c.theta_start / 8.0 + 300.0 * t_c / F_ISR * 8192.0;
+	CHECK_NEAR((double)be64(rs + 18), expected, 2.0);
+
+	// Overwritten while copying: the hook writes a full ring of new records
+	hook_ctx h = {&c, &s, 120};
+	e.read_copy_hook = hook_feed;
+	e.read_copy_hook_arg = &h;
+	build_read(rq, &l, 1, 100, 10);
+	process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_OVERWRITTEN);
+	e.read_copy_hook = NULL;
+}
+
 int main(void) {
 	test_crc16();
 	test_angle_counter();
@@ -563,6 +853,10 @@ int main(void) {
 	test_start_rules();
 	test_sample_print_interplay();
 	test_isr_timing();
+	test_protocol_framing();
+	test_protocol_info();
+	test_protocol_start_status_stop();
+	test_protocol_read();
 
 	printf("%d Pruefungen, %d Fehler\n", g_checks, g_failed);
 	return g_failed == 0 ? 0 : 1;
