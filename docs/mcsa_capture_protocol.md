@@ -155,6 +155,7 @@ Bei `NOT_AVAILABLE` und `OVERWRITTEN` enthält der Körper den ältesten verfüg
 | 5 | `UNKNOWN_CMD` | | | 5 | `INDEX_LIMIT` |
 | 6 | `BAD_VERSION` | | | 6 | `ANGLE_LIMIT` |
 | 7 | `NOT_FOC` | | | 7 | `SAMPLE_PRINT` |
+| | | | | 8 | `ANGLE_STEP` (4 oder mehr el. Umdrehungen zwischen zwei Datensätzen) |
 
 ## Kanäle
 
@@ -190,6 +191,7 @@ d = ((np.diff(a) + 32768) % 65536) - 32768
 theta_q13 = anchor + np.concatenate(([0], np.cumsum(d)))   # 1/8192 el. Umdrehung
 ```
 
+- Die Abwicklung setzt weniger als 4 elektrische Umdrehungen zwischen zwei Datensätzen voraus (f_e · R / f_ISR < 4, bei R = 64 bis 1875 Hz elektrisch). Andernfalls endet die Aufnahme mit `ANGLE_STEP`, statt falsche Winkel zu liefern.
 - Mechanischer Winkel: θ_q13 / (8192 · Polpaare) Umdrehungen. Der Nullpunkt ist beliebig, bleibt aber innerhalb eines stabil laufenden Motorlaufs fest. Getrennte Aufnahmen und Blöcke hinter Lücken lassen sich so phasenrichtig verbinden. Über Beobachterverlust, Motorneustart oder Reboot hinweg ist das nicht garantiert.
 
 ## Zeitachse und Filter
@@ -225,6 +227,12 @@ theta_q13 = anchor + np.concatenate(([0], np.cumsum(d)))   # 1/8192 el. Umdrehun
 3. `STOP` mit der Sitzung.
 4. Den Rest bis zum gemeldeten `n_written` abholen.
 
+**Robustheit im Client:**
+- `READ`-Antworten mit falschem Startindex, fremder Sitzung oder unpassender Länge gelten als veraltet (zum Beispiel nach einer Zeitüberschreitung) und werden verworfen.
+- Ändert sich bei `START` die Sitzung nicht, hat das Token zufällig einen früheren `START` wiederholt; der Client startet dann mit neuem Token.
+- Springt die Laufzeit zurück, bricht die Aufnahme mit Reboot-Meldung ab.
+- Bricht eine Daueraufnahme ab, sendet der Client noch `STOP`. Eine verwaiste Aufnahme beendet `mcsa_capture_client.py PORT [--can ID] stop`.
+
 Durchsatz:
 - **USB:** reicht für die Daueraufnahme mit R = 10 bei voller Standardmaske.
 - **CAN mit 500 kbit/s:** Die Statusmeldungen der Controller belegen schon etwa ein Viertel des Busses. Für eine Daueraufnahme über CAN mit 4 Kanälen deshalb R ≥ 20 wählen und immer nur einen Knoten zur Zeit aufnehmen lassen. Eine Einzelaufnahme mit beliebigem R ist über CAN in etwa 2–3 s abgeholt (40 KB Puffer, rund 85 Anfragen).
@@ -235,11 +243,11 @@ Beide Funktionen nutzen denselben Speicher:
 
 - **Während einer MCSA-Aufnahme** werden `COMM_SAMPLE_PRINT`-Anfragen verworfen.
 - **`START`** wird mit `BUSY` abgelehnt, solange `COMM_SAMPLE_PRINT` aufnimmt oder sein Sende-Thread noch liest.
-- **Eine neue `COMM_SAMPLE_PRINT`-Aufnahme** übernimmt den Speicher. Eine fertige MCSA-Aufnahme wird dadurch `INVALID` (Stoppgrund `SAMPLE_PRINT`).
+- **Eine neue `COMM_SAMPLE_PRINT`-Aufnahme** übernimmt den Speicher. Eine fertige MCSA-Aufnahme wird dadurch `INVALID` (Stoppgrund `SAMPLE_PRINT`). Die erste solche Übernahme löscht den Speicher, damit nie MCSA-Bytes als Sample-Print gesendet werden.
 - **`SEND_LAST_SAMPLES`** wird nach einer MCSA-Aufnahme verworfen, bis `COMM_SAMPLE_PRINT` wieder selbst aufgenommen hat.
 - **Ohne MCSA-Nutzung** verhält sich `COMM_SAMPLE_PRINT` wie in Stock 6.02.
 
-Eine Konfigurationsänderung (`mc_interface_set_configuration`, zum Beispiel durch `vesc_tool --setMcConf`) beendet eine laufende Aufnahme mit `CONFIG_CHANGED`.
+Eine Konfigurationsänderung (`mc_interface_set_configuration`, zum Beispiel durch `vesc_tool --setMcConf`) beendet eine laufende Aufnahme mit `CONFIG_CHANGED`. Geprüft wird am Anfang und am Ende der Änderung.
 
 ## Echtzeit
 

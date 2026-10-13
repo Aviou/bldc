@@ -31,7 +31,7 @@ STATUS_NAMES = ['OK', 'BUSY', 'BAD_ARG', 'NOT_AVAILABLE', 'OVERWRITTEN', 'UNKNOW
 STATE_IDLE, STATE_RUNNING, STATE_DONE, STATE_INVALID = range(4)
 STATE_NAMES = ['IDLE', 'RUNNING', 'DONE', 'INVALID']
 STOP_NAMES = ['NONE', 'LENGTH', 'STOP_CMD', 'OFFSETS_CHANGED', 'CONFIG_CHANGED',
-              'INDEX_LIMIT', 'ANGLE_LIMIT', 'SAMPLE_PRINT']
+              'INDEX_LIMIT', 'ANGLE_LIMIT', 'SAMPLE_PRINT', 'ANGLE_STEP']
 MODE_ONESHOT, MODE_CONTINUOUS = 1, 2
 
 CHANNELS = ['ia', 'ib', 'ic', 'id', 'iq', 'vd', 'vq', 'angle', 'flags']
@@ -40,6 +40,8 @@ CIC_ORDER = 3
 RESP_MAX = 511              # PACKET_MAX_PL_LEN - 1 (Paket-ID)
 READ_OVERHEAD = 28
 HDR_FMT = '>2sBBBHI'        # Magic, Version, Befehl|0x80, Status, Sitzung, Laufzeit ms
+UPTIME_WRAP_MS = (2 ** 32 * 1000) // 10000   # Laufzeit springt nach ~4,97 Tagen auf 0
+UPTIME_WRAP_WINDOW_MS = 600000
 INFO_FMT = '>BBBBIff16s'
 STATUS_FMT = '>BBBHBBBIIIIff3fqffI'
 STATUS_KEYS = ['state', 'stop_reason', 'mode', 'mask', 'decimation', 'cic_order', 'pole_pairs',
@@ -118,27 +120,41 @@ def is_response(packet, cmd):
 
 
 class SerialTransport:
-    """USB-Verbindung zum Bridge-VESC; mit can_id wird jede Anfrage weitergeleitet."""
+    """USB-Verbindung zum Bridge-VESC; mit can_id wird jede Anfrage weitergeleitet.
+
+    Vor jeder Anfrage wird der Empfang geleert, damit verspätete Antworten früherer
+    Anfragen nicht als neue gelten. Weitere Pakete bleiben für receive() vorgemerkt.
+    """
 
     def __init__(self, port, can_id=None, timeout=1.0):
         import serial
         self.ser = serial.Serial(port, 115200, timeout=0.01, exclusive=True)
         self.ser.reset_input_buffer()
         self.deframer = Deframer()
+        self.pending = []
         self.can_id = can_id
         self.timeout = timeout
 
     def request(self, app_payload, cmd):
+        self.ser.reset_input_buffer()
+        self.deframer = Deframer()
+        self.pending = []
         self.ser.write(frame(wrap_packet(app_payload, self.can_id)))
+        return self.receive(cmd)
+
+    def receive(self, cmd):
+        """Nächstes Antwortpaket auf `cmd`, ohne neu anzufragen."""
         t0 = time.monotonic()
-        while time.monotonic() - t0 < self.timeout:
+        while True:
+            for i, p in enumerate(self.pending):
+                if is_response(p, cmd):
+                    return self.pending.pop(i)[1:]
+            if time.monotonic() - t0 >= self.timeout:
+                raise TimeoutError(f'keine Antwort auf Befehl {cmd}')
             chunk = self.ser.read(4096)
             if chunk:
                 self.deframer.feed(chunk)
-                for p in self.deframer.packets():
-                    if is_response(p, cmd):
-                        return p[1:]
-        raise TimeoutError(f'keine Antwort auf Befehl {cmd}')
+                self.pending.extend(self.deframer.packets())
 
     def close(self):
         self.ser.close()
@@ -218,25 +234,47 @@ class Recording:
         return idx, recs, ang
 
 
+class CaptureAborted(ProtocolError):
+    """Aufnahme abgebrochen; `recording` enthält die bis dahin abgeholten Daten."""
+
+    def __init__(self, message, info, recording):
+        super().__init__(message)
+        self.info = info
+        self.recording = recording
+
+
 class McsaClient:
     def __init__(self, transport, retries=3):
         self.t = transport
         self.retries = retries
         self.last_uptime = None
         self.reboots = 0
+        self._guard_reboots = None
 
-    def _request(self, cmd, args=b''):
+    def _note_uptime(self, uptime):
+        last = self.last_uptime
+        self.last_uptime = uptime
+        # Veraltete Antworten sind hier schon aussortiert, die Laufzeit steigt also monoton
+        if last is None or uptime >= last:
+            return
+        if last > UPTIME_WRAP_MS - UPTIME_WRAP_WINDOW_MS and uptime < UPTIME_WRAP_WINDOW_MS:
+            return      # Überlauf des 32-Bit-Systemticks, kein Neustart
+        self.reboots += 1
+        if self._guard_reboots is not None:
+            raise ProtocolError('Controller-Reboot erkannt, Aufnahme verloren')
+
+    def _request(self, cmd, args=b'', accept=None):
+        """Anfrage mit Wiederholung; `accept(hdr, body)` sortiert veraltete Antworten aus."""
         err = None
         for _ in range(self.retries):
             try:
-                resp = self.t.request(app_request(cmd, args), cmd)
+                hdr, body = parse_header(self.t.request(app_request(cmd, args), cmd))
+                while accept is not None and not accept(hdr, body):
+                    hdr, body = parse_header(self.t.receive(cmd))
             except TimeoutError as e:
                 err = e
                 continue
-            hdr, body = parse_header(resp)
-            if self.last_uptime is not None and hdr['uptime_ms'] < self.last_uptime:
-                self.reboots += 1
-            self.last_uptime = hdr['uptime_ms']
+            self._note_uptime(hdr['uptime_ms'])
             if hdr['status'] == BAD_VERSION:
                 raise ProtocolError('Firmware spricht eine andere Protokollversion')
             return hdr, body
@@ -263,14 +301,20 @@ class McsaClient:
         return s
 
     def start(self, mode, mask, decimation, length=0, token=None):
-        token = token if token is not None else random.randint(1, 0xFFFF)
-        args = struct.pack('>BHBIH', mode, mask, decimation, length, token)
-        hdr, b = self._request(CMD_START, args)
-        if hdr['status'] != OK:
-            raise ProtocolError(f"START abgelehnt: {STATUS_NAMES[hdr['status']]}")
-        capacity, rec_bytes, mask_r, dec_r = struct.unpack('>IBHB', b[:8])
-        return {'session': hdr['session'], 'capacity': capacity, 'rec_bytes': rec_bytes,
-                'mask': mask_r, 'decimation': dec_r, 'token': token}
+        """Startet eine neue Aufnahme. Bleibt die Sitzung gleich, hat das Token zufällig
+        einen früheren START wiederholt; dann wird mit neuem Token erneut gestartet."""
+        before = self.status()['session']
+        for attempt in range(3):
+            tok = token if (token is not None and attempt == 0) else random.randint(1, 0xFFFF)
+            args = struct.pack('>BHBIH', mode, mask, decimation, length, tok)
+            hdr, b = self._request(CMD_START, args)
+            if hdr['status'] != OK:
+                raise ProtocolError(f"START abgelehnt: {STATUS_NAMES[hdr['status']]}")
+            if hdr['session'] != before:
+                capacity, rec_bytes, mask_r, dec_r = struct.unpack('>IBHB', b[:8])
+                return {'session': hdr['session'], 'capacity': capacity, 'rec_bytes': rec_bytes,
+                        'mask': mask_r, 'decimation': dec_r, 'token': tok}
+        raise ProtocolError('START: Sitzung blieb unverändert (Token-Kollision)')
 
     def stop(self, session):
         hdr, b = self._request(CMD_STOP, struct.pack('>H', session))
@@ -279,20 +323,36 @@ class McsaClient:
         n_written, reason = struct.unpack('>IB', b[:5])
         return hdr['status'], n_written, reason
 
-    def read(self, session, start, count=0xFFFF):
+    def stop_current(self):
+        """Stoppt eine laufende Aufnahme, gleich welcher Client sie gestartet hat."""
+        s = self.status()
+        if s['state'] != STATE_RUNNING:
+            return NOT_AVAILABLE, s['n_written'], s['stop_reason']
+        return self.stop(s['session'])
+
+    def read(self, session, start, count=0xFFFF, rec_bytes=None):
+        def accept(hdr, body):
+            if hdr['status'] != OK:
+                return True
+            if hdr['session'] != session or len(body) < 15:
+                return False
+            start_r, n, rb, _ = struct.unpack('>IHBq', body[:15])
+            return (start_r == start and n <= count and (rec_bytes is None or rb == rec_bytes)
+                    and len(body) == 15 + n * rb + 2)
+
         for _ in range(self.retries):
-            hdr, b = self._request(CMD_READ, struct.pack('>HIH', session, start, count))
+            hdr, b = self._request(CMD_READ, struct.pack('>HIH', session, start, count), accept)
             if hdr['status'] != OK:
                 if len(b) < 8:
                     raise ProtocolError(f"READ: {STATUS_NAMES[hdr['status']]}")
                 oldest, n_written = struct.unpack('>II', b[:8])
                 return hdr['status'], {'oldest': oldest, 'n_written': n_written,
                                        'session': hdr['session']}
-            start_r, n, rec_bytes, anchor = struct.unpack('>IHBq', b[:15])
-            data = b[15:15 + n * rec_bytes]
-            crc = struct.unpack('>H', b[15 + n * rec_bytes:17 + n * rec_bytes])[0]
+            start_r, n, rb, anchor = struct.unpack('>IHBq', b[:15])
+            data = b[15:15 + n * rb]
+            crc = struct.unpack('>H', b[15 + n * rb:17 + n * rb])[0]
             if crc16(data) == crc:
-                return OK, {'start': start_r, 'count': n, 'rec_bytes': rec_bytes,
+                return OK, {'start': start_r, 'count': n, 'rec_bytes': rb,
                             'anchor': anchor, 'data': data}
         raise ProtocolError('READ: CRC-Fehler trotz Wiederholung')
 
@@ -302,72 +362,83 @@ class McsaClient:
                 raise ProtocolError('Controller-Reboot erkannt, Aufnahme verloren')
             raise ProtocolError('Sitzung hat gewechselt (anderer Client?)')
 
-    def _fetch(self, rec, session, start, end):
-        nxt = start
-        while nxt < end:
-            status, r = self.read(session, nxt)
-            if status == OK:
-                if r['count'] == 0:
-                    raise ProtocolError('READ lieferte vor dem Ende keine Daten')
+    def _read_into(self, rec, session, nxt):
+        """Ein READ ab `nxt`; trägt Daten oder Lücken ein und liefert den neuen Index."""
+        status, r = self.read(session, nxt, rec_bytes=2 * rec.nch)
+        if status == OK:
+            if r['count']:
                 rec.add_block(r['start'], r['data'], r['anchor'])
-                nxt += r['count']
-            elif status == OVERWRITTEN:
+            return nxt + r['count'], r['count']
+        if status == OVERWRITTEN:
+            if r['oldest'] > nxt:
                 rec.gaps.append((nxt, r['oldest']))
-                nxt = r['oldest']
-            else:
-                self._check_session(session, r['session'])
-                raise ProtocolError(f'READ: {STATUS_NAMES[status]}')
-        return rec
+                return r['oldest'], 0
+            return nxt, 0       # veraltete Fehlermeldung, erneut lesen
+        self._check_session(session, r['session'] if self.reboots == 0 else -1)
+        raise ProtocolError(f'READ: {STATUS_NAMES[status]}')
 
     def capture(self, mask=MASK_DEFAULT, decimation=10, length=0, poll=0.05, wait=time.sleep):
         """Einzelaufnahme: starten, auf Ende warten, vollständig abholen."""
         info = self.info()
-        st = self.start(MODE_ONESHOT, mask, decimation, length)
-        n = length or st['capacity']
-        timeout = (n + CIC_ORDER) * decimation / info['f_isr'] + 5.0
-        t0 = time.monotonic()
-        while True:
-            s = self.status()
-            self._check_session(st['session'], s['session'])
-            if s['state'] != STATE_RUNNING:
-                break
-            if time.monotonic() - t0 > timeout:
-                raise TimeoutError('Einzelaufnahme wird nicht fertig')
-            wait(poll)
         rec = Recording(mask, decimation, info['f_isr'])
-        self._fetch(rec, st['session'], 0, s['n_written'])
-        return info, s, rec
+        self._guard_reboots = self.reboots
+        try:
+            st = self.start(MODE_ONESHOT, mask, decimation, length)
+            n = length or st['capacity']
+            timeout = (n + CIC_ORDER) * decimation / info['f_isr'] + 5.0
+            t0 = time.monotonic()
+            while True:
+                s = self.status()
+                self._check_session(st['session'], s['session'])
+                if s['state'] != STATE_RUNNING:
+                    break
+                if time.monotonic() - t0 > timeout:
+                    raise TimeoutError('Einzelaufnahme wird nicht fertig')
+                wait(poll)
+            nxt = 0
+            while nxt < s['n_written']:
+                nxt, got = self._read_into(rec, st['session'], nxt)
+                if got == 0 and nxt < s['n_written'] and not rec.gaps:
+                    raise ProtocolError('READ lieferte vor dem Ende keine Daten')
+            return info, s, rec
+        except (Exception, KeyboardInterrupt) as e:
+            raise CaptureAborted(f'Einzelaufnahme abgebrochen: {e}', info, rec) from e
+        finally:
+            self._guard_reboots = None
 
     def stream(self, mask=MASK_DEFAULT, decimation=10, seconds=10.0, idle=0.002,
                clock=time.monotonic, wait=time.sleep):
-        """Daueraufnahme: fortlaufend abholen, nach `seconds` stoppen und den Rest holen."""
+        """Daueraufnahme: fortlaufend abholen, nach `seconds` stoppen und den Rest holen.
+        Bei einem Abbruch wird die Aufnahme am Controller gestoppt (soweit erreichbar)."""
         info = self.info()
-        st = self.start(MODE_CONTINUOUS, mask, decimation)
-        session = st['session']
         rec = Recording(mask, decimation, info['f_isr'])
-        t_end = clock() + seconds
-        nxt, final = 0, None
-        while final is None or nxt < final:
-            if final is None and clock() >= t_end:
-                status, final, _ = self.stop(session)
-                if status != OK:
-                    self._check_session(session, -1)
-                continue
-            status, r = self.read(session, nxt)
-            if status == OK:
-                if r['count'] == 0:
-                    wait(idle)
+        session, final = None, None
+        self._guard_reboots = self.reboots
+        try:
+            session = self.start(MODE_CONTINUOUS, mask, decimation)['session']
+            t_end = clock() + seconds
+            nxt = 0
+            while final is None or nxt < final:
+                if final is None and clock() >= t_end:
+                    status, final, _ = self.stop(session)
+                    if status != OK:
+                        self._check_session(session, -1)
                     continue
-                rec.add_block(r['start'], r['data'], r['anchor'])
-                nxt += r['count']
-            elif status == OVERWRITTEN:
-                rec.gaps.append((nxt, r['oldest']))
-                nxt = r['oldest']
-            else:
-                self._check_session(session, r['session'] if self.reboots == 0 else -1)
-                raise ProtocolError(f'READ: {STATUS_NAMES[status]}')
-        s = self.status()
-        return info, s, rec
+                nxt, got = self._read_into(rec, session, nxt)
+                if got == 0:
+                    wait(idle)
+            s = self.status()
+            return info, s, rec
+        except (Exception, KeyboardInterrupt) as e:
+            self._guard_reboots = None
+            if session is not None and final is None:
+                try:
+                    self.stop(session)
+                except Exception:
+                    pass
+            raise CaptureAborted(f'Daueraufnahme abgebrochen: {e}', info, rec) from e
+        finally:
+            self._guard_reboots = None
 
     def offset_check(self, decimation=10, length=1000, threshold=1.5, wait=time.sleep):
         """Rest-Offset der drei Shunts im Stillstand, in ADC-Stufen."""
@@ -380,6 +451,9 @@ class McsaClient:
                 'warning': bool(np.any(np.abs(resid) > threshold))}
 
 
+COLUMN_FORMATS = {'index': '%d', 'angle_q13': '%d', 'flags': '%d', 'angle_el_rev': '%.6f'}
+
+
 def to_table(rec, status):
     idx, recs, ang = rec.arrays()
     cols = {'index': idx, 't_s': record_times(idx, rec.decimation, rec.f_isr)}
@@ -390,6 +464,7 @@ def to_table(rec, status):
         elif ch in ('vd', 'vq'):
             cols[ch + '_V'] = x.astype(float) / 1000.0
         elif ch == 'angle':
+            cols['angle_q13'] = ang
             cols['angle_el_rev'] = ang.astype(float) / 8192.0
         elif ch == 'flags':
             cols['flags'] = x.astype(np.uint16)
@@ -401,11 +476,15 @@ def _json_default(o):
 
 
 def write_outputs(prefix, info, status, rec, params, client):
+    """CSV (ganzzahlige Spalten exakt, Winkel zusätzlich als 1/8192-Zählwert) und JSON-Kopf."""
     cols = to_table(rec, status)
     names = list(cols)
-    table = np.column_stack([np.asarray(cols[n], dtype=float) for n in names]) if len(cols['index']) \
-        else np.zeros((0, len(names)))
-    np.savetxt(prefix + '.csv', table, delimiter=',', header=','.join(names), comments='', fmt='%.9g')
+    fmts = [COLUMN_FORMATS.get(n, '%.9g') for n in names]
+    columns = [np.asarray(cols[n]).tolist() for n in names]
+    with open(prefix + '.csv', 'w') as f:
+        f.write(','.join(names) + '\n')
+        for row in zip(*columns):
+            f.write(','.join(fm % v for fm, v in zip(fmts, row)) + '\n')
     meta = {
         'info': info,
         'status': status,
@@ -437,6 +516,7 @@ def main(argv=None):
     sub = p.add_subparsers(dest='cmd', required=True)
     sub.add_parser('info')
     sub.add_parser('status')
+    sub.add_parser('stop', help='laufende Aufnahme beenden (z. B. nach einem Abbruch)')
     pc = sub.add_parser('capture', help='Einzelaufnahme')
     pc.add_argument('--mask', type=lambda v: int(v, 0), default=MASK_DEFAULT)
     pc.add_argument('--decimation', type=int, default=10)
@@ -460,18 +540,31 @@ def main(argv=None):
             print(json.dumps(client.info(), indent=2))
         elif args.cmd == 'status':
             print(json.dumps(client.status(), indent=2, default=_json_default))
-        elif args.cmd == 'capture':
-            info, s, rec = client.capture(args.mask, args.decimation, args.length)
-            write_outputs(args.out, info, s, rec, vars(args), client)
-            print(_summary(s, rec), file=sys.stderr)
-        elif args.cmd == 'stream':
-            info, s, rec = client.stream(args.mask, args.decimation, args.seconds)
+        elif args.cmd == 'stop':
+            status, n_written, reason = client.stop_current()
+            print(f'{STATUS_NAMES[status]}: {n_written} Datensätze, Stoppgrund {STOP_NAMES[reason]}')
+        elif args.cmd in ('capture', 'stream'):
+            if args.cmd == 'capture':
+                info, s, rec = client.capture(args.mask, args.decimation, args.length)
+            else:
+                info, s, rec = client.stream(args.mask, args.decimation, args.seconds)
             write_outputs(args.out, info, s, rec, vars(args), client)
             print(_summary(s, rec), file=sys.stderr)
         elif args.cmd == 'offset-check':
             r = client.offset_check(args.decimation, args.length, args.threshold)
             print(json.dumps(r, indent=2))
             return 1 if r['warning'] else 0
+    except CaptureAborted as e:
+        if getattr(args, 'out', None) and e.info:
+            params = dict(vars(args), aborted=str(e))
+            status = {'amp_per_unit': e.info['fac_current'] / 8.0}
+            write_outputs(args.out, e.info, status, e.recording, params, client)
+            print(f'Teildaten gespeichert unter {args.out}.csv/.json', file=sys.stderr)
+        print(f'Fehler: {e}', file=sys.stderr)
+        return 2
+    except (ProtocolError, TimeoutError) as e:
+        print(f'Fehler: {e}', file=sys.stderr)
+        return 2
     finally:
         transport.close()
     return 0

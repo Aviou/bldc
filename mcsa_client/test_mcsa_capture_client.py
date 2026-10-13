@@ -4,6 +4,7 @@ Aufruf aus dem Repo-Wurzelverzeichnis: python3 -m pytest -p no:cacheprovider mcs
 """
 import ctypes
 import os
+import struct
 import subprocess
 
 import numpy as np
@@ -59,7 +60,11 @@ class Sim:
 
 
 class LibTransport:
-    """Simulierter Bridge-Weg: Framing, optionale CAN-Weiterleitung, Kern statt Firmware."""
+    """Simulierter Bridge-Weg: Framing, optionale CAN-Weiterleitung, Kern statt Firmware.
+
+    Antworten landen in einer Warteschlange wie im seriellen Empfangspuffer; verspätete
+    Antworten (delay_response_of) tauchen dort erst bei der nächsten Anfrage auf.
+    """
 
     def __init__(self, lib, h, sim, can_id=None, feed_per_request=0):
         self.lib, self.h, self.sim = lib, h, sim
@@ -67,10 +72,15 @@ class LibTransport:
         self.feed_per_request = feed_per_request
         self.uptime = 1000
         self.lose_response_of = set()
+        self.delay_response_of = set()
+        self.fail_reads_after = None
         self.requests = 0
+        self.queue = []
 
     def request(self, app_payload, cmd):
         self.requests += 1
+        if cmd == mc.CMD_READ and self.fail_reads_after is not None and self.requests > self.fail_reads_after:
+            raise TimeoutError('simulierter Verbindungsabbruch')
         d = mc.Deframer()
         d.feed(mc.frame(mc.wrap_packet(app_payload, self.can_id)))
         (pkt,) = d.packets()
@@ -91,8 +101,18 @@ class LibTransport:
         if cmd in self.lose_response_of:
             self.lose_response_of.discard(cmd)
             raise TimeoutError('simulierter Antwortverlust')
-        assert mc.is_response(back, cmd)
-        return back[1:]
+        if cmd in self.delay_response_of:
+            self.delay_response_of.discard(cmd)
+            self.queue.append(back)
+            raise TimeoutError('simulierte Verspätung')
+        self.queue.append(back)
+        return self.receive(cmd)
+
+    def receive(self, cmd):
+        for i, p in enumerate(self.queue):
+            if mc.is_response(p, cmd):
+                return self.queue.pop(i)[1:]
+        raise TimeoutError('keine weitere Antwort')
 
 
 @pytest.fixture
@@ -252,9 +272,129 @@ def test_write_outputs(rig, tmp_path):
     prefix = str(tmp_path / 'm1')
     mc.write_outputs(prefix, info, s, rec, {'mode': 'capture'}, client)
     lines = open(prefix + '.csv').read().splitlines()
-    assert lines[0] == 'index,t_s,ia_A,ib_A,ic_A,angle_el_rev,flags'
+    assert lines[0] == 'index,t_s,ia_A,ib_A,ic_A,angle_q13,angle_el_rev,flags'
     assert len(lines) == 101
     import json
     meta = json.load(open(prefix + '.json'))
     assert meta['records'] == 100 and meta['gaps'] == []
     assert meta['cic']['group_delay_s'] == pytest.approx(13.5 / 30000.0)
+
+
+# ---------------- Befunde aus dem Abschluss-Review ----------------
+
+def test_late_read_response_does_not_shift_data(rig):
+    client, t, sim = rig(feed_per_request=2000)
+    t.delay_response_of.add(mc.CMD_READ)
+    info, s, rec = client.capture(mask=0x0001, decimation=1, length=1000, wait=NOWAIT)
+    idx, recs, _ = rec.arrays()
+    assert list(idx) == list(range(1000)) and rec.gaps == []
+    ramp_ok(recs, idx)
+    assert client.reboots == 0
+
+
+def test_uptime_jump_aborts_even_with_same_session(rig):
+    client, t, sim = rig(feed_per_request=100)
+    ticks = iter(range(10 ** 6))
+
+    def clock():
+        k = next(ticks)
+        if k == 10:
+            t.uptime = 5        # Laufzeit springt zurück, Sitzungsnummer bleibt gleich
+        return k
+
+    with pytest.raises(mc.ProtocolError, match='Reboot'):
+        client.stream(mask=0x0001, decimation=1, seconds=1000, clock=clock, wait=NOWAIT)
+
+
+def test_uptime_wrap_is_not_a_reboot(rig):
+    client, t, sim = rig()
+    t.uptime = mc.UPTIME_WRAP_MS - 2
+    client.status()
+    t.uptime = 3
+    client.status()
+    assert client.reboots == 0
+
+
+def test_aborted_stream_stops_capture_and_keeps_partial_data(rig):
+    client, t, sim = rig(feed_per_request=100)
+    t.fail_reads_after = 8
+    ticks = iter(range(10 ** 6))
+    with pytest.raises(mc.CaptureAborted) as ei:
+        client.stream(mask=0x0001, decimation=1, seconds=1000, clock=lambda: next(ticks), wait=NOWAIT)
+    assert len(ei.value.recording.arrays()[0]) > 0
+    t.fail_reads_after = None
+    s = client.status()
+    assert s['state'] == mc.STATE_DONE and mc.STOP_NAMES[s['stop_reason']] == 'STOP_CMD'
+
+
+def test_stop_current_ends_running_capture(rig):
+    client, t, sim = rig(feed_per_request=100)
+    client.start(mc.MODE_CONTINUOUS, 0x0001, 1)
+    status, n_written, reason = client.stop_current()
+    assert status == mc.OK and mc.STOP_NAMES[reason] == 'STOP_CMD'
+    assert client.status()['state'] == mc.STATE_DONE
+
+
+def test_token_collision_starts_new_capture(rig, monkeypatch):
+    client, t, sim = rig(feed_per_request=2000)
+    tokens = iter([7, 7, 9])
+    monkeypatch.setattr(mc.random, 'randint', lambda a, b: next(tokens))
+    _, s1, _ = client.capture(mask=0x0001, decimation=1, length=100, wait=NOWAIT)
+    _, s2, _ = client.capture(mask=0x0001, decimation=1, length=100, wait=NOWAIT)
+    assert s1['session'] == 1 and s2['session'] == 2
+
+
+def test_csv_keeps_full_angle_and_index_resolution(tmp_path):
+    import types
+    rec = mc.Recording(0x0080, 10, 30000.0)
+    anchor = 1_200_000 * 8192
+    rec.add_block(1_234_567_890, struct.pack('>3H', *[(anchor + k) & 0xFFFF for k in range(3)]), anchor)
+    prefix = str(tmp_path / 'x')
+    mc.write_outputs(prefix, {}, {'amp_per_unit': 0.01}, rec, {}, types.SimpleNamespace(reboots=0))
+    lines = open(prefix + '.csv').read().splitlines()
+    assert lines[0] == 'index,t_s,angle_q13,angle_el_rev'
+    rows = [l.split(',') for l in lines[1:]]
+    assert [r[0] for r in rows] == ['1234567890', '1234567891', '1234567892']
+    assert [int(r[2]) for r in rows] == [anchor, anchor + 1, anchor + 2]
+    assert len({r[3] for r in rows}) == 3
+
+
+class FakeSerial:
+    """Serielle Schnittstelle mit Empfangspuffer; write() legt vorbereitete Antworten nach."""
+
+    def __init__(self):
+        self.rx = bytearray()
+        self.replies = []
+
+    def reset_input_buffer(self):
+        self.rx.clear()
+
+    def write(self, data):
+        if self.replies:
+            self.rx.extend(self.replies.pop(0))
+
+    def read(self, n):
+        out = bytes(self.rx[:n])
+        del self.rx[:n]
+        return out
+
+    def close(self):
+        pass
+
+
+def _status_packet(session, uptime):
+    body = struct.pack(mc.HDR_FMT, mc.MAGIC, 1, mc.CMD_STATUS | 0x80, mc.OK, session, uptime)
+    return mc.frame(bytes([mc.COMM_CUSTOM_APP_DATA]) + body)
+
+
+def test_serial_transport_flushes_stale_input_and_keeps_later_packets():
+    t = object.__new__(mc.SerialTransport)
+    t.ser, t.deframer, t.pending, t.can_id, t.timeout = FakeSerial(), mc.Deframer(), [], None, 0.2
+    t.ser.rx.extend(_status_packet(1, 100))                     # veraltet, liegt schon im Puffer
+    t.ser.replies.append(_status_packet(2, 200) + _status_packet(3, 300))
+    first = t.request(mc.app_request(mc.CMD_STATUS), mc.CMD_STATUS)
+    assert mc.parse_header(first)[0]['session'] == 2
+    later = t.receive(mc.CMD_STATUS)
+    assert mc.parse_header(later)[0]['session'] == 3
+    with pytest.raises(TimeoutError):
+        t.receive(mc.CMD_STATUS)

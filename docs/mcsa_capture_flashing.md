@@ -115,3 +115,5 @@ Prüfungen über CAN:
 - **Bricht die Übertragung ab (Kabel ab, Verbindung weg), bleibt die alte Firmware aktiv.** Die neue liegt zunächst in einem eigenen Flash-Bereich. Kritisch ist das kurze Umkopieren durch den Bootloader nach der Übertragung: währenddessen die Versorgung auf keinen Fall unterbrechen.
 - **Lädt die motorpi-App ein Motorprofil** (`--setMcConf`), endet eine laufende Aufnahme mit `CONFIG_CHANGED`. Das ist gewollt: Das Profil überschreibt auch die Strom-Offsets (Messbericht, Abschnitt 16).
 - **Der Client hält den Port exklusiv.** Solange er läuft, kann die App nicht auf den VESC zugreifen.
+- **Nach einem abgebrochenen `stream`** stoppt der Client die Aufnahme selbst und speichert die Teildaten (Abbruchgrund in der JSON-Datei). War der Controller dabei nicht erreichbar, beendet `CLIENT /dev/ttyACM0 [--can ID] stop` die Aufnahme; solange sie läuft, werden VESC-Tool-Sampling und neue Aufnahmen abgelehnt.
+- **CSV-Spalten:** `index`, `t_s`, Ströme in A, Spannungen in V, `angle_q13` (exakter Winkel in 1/8192 elektrischer Umdrehung), `angle_el_rev`, `flags`.

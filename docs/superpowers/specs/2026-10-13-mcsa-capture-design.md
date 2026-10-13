@@ -123,7 +123,7 @@ Grenzen: Der Winkel ist bei sensorlosem Betrieb eine Schätzung des Beobachters.
 - **Offset fest je Aufnahme:** Beim ersten ISR-Durchlauf nach `START` werden die drei Offsets eingefroren und auf 1/8 Stufe gerundet: `off_q3 = round(8·o)`, zerlegt in `oi = floor(off_q3 / 8)` und `of = off_q3 − 8·oi` ∈ [0, 7]. Ändert sich ein Offset während der Aufnahme (z. B. `foc_dc_cal`), endet die Aufnahme mit Grund `OFFSETS_CHANGED`; die bis dahin geschriebenen Daten bleiben gültig.
 - **Ströme ia/ib/ic:** Eingang `x = a − oi` (ganze Stufen, |x| ≤ 4095 → 13 Bit mit Vorzeichen). Kammergebnis `y` ≤ 13 + 3·log2(64) = 31 Bit. Ausgabe in 1/8 Stufe mit **einer** Rundung: `out = round(8·y / R³) − of`. Berechnet ohne Überlauf über Quotient und Rest (`q = y / R³`, `r = y % R³`, `out = 8q + round(8r / R³) − of`), Rundung „halb von null weg“. Fehler insgesamt ≤ 1/16 Stufe (Offset) + 1/16 Stufe (Ausgabe). Wertebereich passt immer in `int16_t` (|out| ≤ 32 767).
 - **id/iq** (Eingang 1/8 Stufe: `round(I / FAC_CURRENT · 8)`), **vd/vq** (Eingang mV): Kammergebnis in `int64_t`, Ausgabe `round(y / R³)`, `int16_t` mit Sättigung. Sättigungen werden je Aufnahme gezählt.
-- **Winkel:** Eingang `θ_u − θ_start` (θ_start = θ_u im ersten Durchlauf nach `START`). Der Winkel durchläuft **dasselbe Filter** wie die Ströme. Weil der CIC linearphasig ist, sind alle Frequenzanteile gleich verzögert; der gefilterte Winkel passt damit zum gefilterten Strom, auch bei halbzahliger Gruppenlaufzeit. Ausgabe `θ_f = θ_start + round(y / R³)` (1/65536 Umdrehung). Gespeichert wird `uint16_t` = Bits 3–18 von θ_f, also 1/8192 elektrische Umdrehung modulo 8 Umdrehungen. Zusätzlich hält der Kern `θ_f` des neuesten Datensatzes als `int64_t`; daraus erhält jede `READ`-Antwort einen absoluten Anker (6.5). Erreicht |θ_f − θ_start| 2^44 (≈ 2,7 · 10^8 Umdrehungen), endet die Aufnahme mit `ANGLE_LIMIT`.
+- **Winkel:** Eingang `θ_u − θ_start` (θ_start = θ_u im ersten Durchlauf nach `START`). Der Winkel durchläuft **dasselbe Filter** wie die Ströme. Weil der CIC linearphasig ist, sind alle Frequenzanteile gleich verzögert; der gefilterte Winkel passt damit zum gefilterten Strom, auch bei halbzahliger Gruppenlaufzeit. Ausgabe `θ_f = θ_start + round(y / R³)` (1/65536 Umdrehung). Gespeichert wird `uint16_t` = Bits 3–18 von θ_f, also 1/8192 elektrische Umdrehung modulo 8 Umdrehungen. Zusätzlich hält der Kern `θ_f` des neuesten Datensatzes als `int64_t`; daraus erhält jede `READ`-Antwort einen absoluten Anker (6.5). Erreicht |θ_f − θ_start| 2^44 (≈ 2,7 · 10^8 Umdrehungen), endet die Aufnahme mit `ANGLE_LIMIT`. Liegen zwischen zwei Datensätzen 4 oder mehr elektrische Umdrehungen (f_e · R / f_ISR ≥ 4, bei R = 64 ab 1875 Hz elektrisch), wäre der 16-Bit-Winkel mehrdeutig; die Aufnahme endet dann mit `ANGLE_STEP`.
 - **Flag-Kanal** (optional): je Datensatz Bit k (k = 0..2) gesetzt, wenn im Einflussbereich des Filters (die letzten 3·R ISR-Durchläufe) mindestens einmal `CCRk+1 > ARR − 500` galt, also Phase k so hoch moduliert war, dass ihr Shunt nicht sauber messbar ist (dieselbe Schwelle, die die FOC für die Kanalwahl nutzt). Bit 3 gesetzt, wenn der Motor in allen diesen Durchläufen im Zustand `RUNNING` war. Die CCR-Werte werden am Ende der ISR gelesen und gehören damit zur nächsten PWM-Periode; bei 30 kHz ist das ein Versatz von 2,4° elektrisch bei 200 Hz.
 - Ausgabe alle R ISR-Durchläufe. Die ersten **2** Ausgabewerte nach `START` werden verworfen; der erste gespeicherte Wert stammt damit aus vollständig nach dem Start liegenden Eingangswerten (3·R ≥ 3(R−1)+1).
 - Gruppenlaufzeit 3(R−1)/2 Eingangsabtastungen. Datensatz n (ab 0) gehört zum Eingangsindex `(n+3)·R − 1 − 3(R−1)/2` nach dem Start, also zur Zeit `t_n = ((n+3)·R − 1 − 1,5·(R−1)) / f_ISR`.
@@ -173,9 +173,9 @@ Ein breiteres Nutzband bei gleicher Ausgaberate gibt es nur mit mehrstufiger Dez
 - Regeln:
   - `START` nur, wenn `!mc_interface_sample_print_busy()`; sonst `BUSY`. Mit `START` gelten die Sample-Print-Daten als überschrieben (`sp_valid = false`).
   - `COMM_SAMPLE_PRINT` während einer laufenden MCSA-Aufnahme: verworfen (keine Daten, keine Zustandsänderung).
-  - `COMM_SAMPLE_PRINT` mit Aufnahmemodus bei beendeter MCSA-Aufnahme: übernimmt den Puffer; die MCSA-Aufnahme wird `INVALID` (Grund `SAMPLE_PRINT`), `sp_valid = true`.
+  - `COMM_SAMPLE_PRINT` mit Aufnahmemodus bei beendeter MCSA-Aufnahme: übernimmt den Puffer; die MCSA-Aufnahme wird `INVALID` (Grund `SAMPLE_PRINT`), `sp_valid = true`. Die erste solche Übernahme nach einer MCSA-Aufnahme löscht den Puffer, damit auch Plätze, die die neue Aufnahme nicht erreicht (abgebrochene Aufnahme, früher Trigger), keine MCSA-Bytes enthalten.
   - `SEND_LAST_SAMPLES` nur, wenn `sp_valid`; sonst verworfen.
-  - Modus `OFF` wird immer durchgereicht (schreibt nichts in den Puffer).
+  - Modus `OFF` wird durchgereicht (schreibt nichts in den Puffer), außer während einer laufenden MCSA-Aufnahme; dann ist `m_sample_mode` ohnehin `OFF`.
 - Ohne MCSA-Nutzung verhält sich `COMM_SAMPLE_PRINT` exakt wie in Stock 6.02.
 
 ### 6.3 Datensätze
@@ -210,7 +210,7 @@ Ein breiteres Nutzband bei gleicher Ausgaberate gibt es nur mit mehrstufiger Dez
 | `ONESHOT` | Aufnahme bis Länge L (1 ≤ L ≤ Kapazität, 0 = Kapazität), danach `DONE` mit Grund `LENGTH`. Daten bleiben bis zum nächsten `START` oder bis `COMM_SAMPLE_PRINT` den Puffer übernimmt. |
 | `CONTINUOUS` | Aufnahme bis `STOP`. Der Host holt fortlaufend ab. Was er nicht rechtzeitig holt, wird überschrieben und beim Lesen als `OVERWRITTEN` mit dem ältesten verfügbaren Index gemeldet. |
 
-Start immer „sofort“. `START` nur, wenn der Motor im FOC-Modus konfiguriert ist (sonst `NOT_FOC`). Jede Konfigurationsänderung über `mc_interface_set_configuration()` beendet eine laufende Aufnahme mit Grund `CONFIG_CHANGED`.
+Start immer „sofort“. `START` nur, wenn der Motor im FOC-Modus konfiguriert ist (sonst `NOT_FOC`). Jede Konfigurationsänderung über `mc_interface_set_configuration()` beendet eine laufende Aufnahme mit Grund `CONFIG_CHANGED`, am Anfang und noch einmal am Ende der Änderung (fängt einen `START` ab, der währenddessen über einen anderen Port kam).
 
 ### 6.6 Konsistentes Lesen und Winkelanker
 
@@ -248,7 +248,7 @@ Transport: `COMM_CUSTOM_APP_DATA` (= 36), über USB direkt oder per `COMM_FORWAR
 - `READ` mit `start = n_written` → `OK` mit Anzahl 0 (noch nichts Neues). `start > n_written` oder fremde Sitzung oder Zustand `IDLE`/`INVALID` → `NOT_AVAILABLE`.
 - Höchstens ⌊(511 − 28) / Bytes je Datensatz⌋ Datensätze je `READ` (511 = `PACKET_MAX_PL_LEN` − 1 für die Paket-ID; 28 = Kopf + Felder + CRC), bei 8 B also **60**.
 - Zustände: 0 `IDLE`, 1 `RUNNING`, 2 `DONE`, 3 `INVALID`.
-- Stoppgründe: 0 keiner, 1 `LENGTH`, 2 `STOP_CMD`, 3 `OFFSETS_CHANGED`, 4 `CONFIG_CHANGED`, 5 `INDEX_LIMIT`, 6 `ANGLE_LIMIT`, 7 `SAMPLE_PRINT`.
+- Stoppgründe: 0 keiner, 1 `LENGTH`, 2 `STOP_CMD`, 3 `OFFSETS_CHANGED`, 4 `CONFIG_CHANGED`, 5 `INDEX_LIMIT`, 6 `ANGLE_LIMIT`, 7 `SAMPLE_PRINT`, 8 `ANGLE_STEP`.
 - Statuscodes: 0 `OK`, 1 `BUSY`, 2 `BAD_ARG`, 3 `NOT_AVAILABLE`, 4 `OVERWRITTEN`, 5 `UNKNOWN_CMD`, 6 `BAD_VERSION`, 7 `NOT_FOC`. Zu kurze Anfragen und unbekannte Modi/Masken/R → `BAD_ARG`.
 - Die CRC16 (CCITT, Polynom 0x1021, Startwert 0, wie im VESC-Paketrahmen) über die Datensätze sichert zusätzlich zur Transport-CRC den Weg durch die Bridge.
 
@@ -265,9 +265,11 @@ Transport: `COMM_CUSTOM_APP_DATA` (= 36), über USB direkt oder per `COMM_FORWAR
 ## 9. Host-Client `mcsa_client/mcsa_capture_client.py`
 
 - Abhängigkeiten: `pyserial`, `numpy`. Framing und CRC wie `scripts/mcsa/vesc_sampleprint.py` (motorpi).
-- Transport: USB direkt oder `--can ID`. Port exklusiv, immer nur eine offene Anfrage, Zeitüberschreitung mit Wiederholung (`START` mit demselben Token).
+- Transport: USB direkt oder `--can ID`. Port exklusiv, immer nur eine offene Anfrage, Empfang vor jeder Anfrage geleert, Zeitüberschreitung mit Wiederholung (`START` mit demselben Token). `READ`-Antworten mit falschem Startindex, fremder Sitzung oder unpassender Länge gelten als veraltet und werden verworfen. Bleibt die Sitzung bei `START` gleich (Token-Kollision mit einem früheren `START`), startet der Client mit neuem Token erneut.
+- Reboot: Springt die Laufzeit zurück (außer beim Überlauf des Systemticks nach ~4,97 Tagen), bricht eine laufende Aufnahme ab.
+- Abbruch: Bricht eine Daueraufnahme ab, sendet der Client noch `STOP` und speichert die bis dahin abgeholten Daten. Befehl `stop` beendet eine verwaiste Aufnahme.
 - Befehle: `info`, `status`, `capture` (Einzelaufnahme vollständig abholen, fehlende Blöcke nachfordern), `stream --seconds S` (Daueraufnahme, fortlaufend abholen, Lücken mit exakten Indizes protokollieren), `offset-check` (kurze Einzelaufnahme im Stillstand, Rest-Offset je Kanal in Stufen; Warnung ab 1,5 Stufen).
-- Ausgabe: CSV mit Index, Zeit, Kanälen in physikalischen Einheiten (A, V), abgewickeltem elektrischem Winkel in Umdrehungen und Flags; daneben JSON mit Kopf (INFO, STATUS, Parameter, Lücken, Reboot-Erkennung).
+- Ausgabe: CSV mit Index, Zeit, Kanälen in physikalischen Einheiten (A, V), abgewickeltem elektrischem Winkel exakt als `angle_q13` (1/8192 Umdrehung, ganzzahlig) und als `angle_el_rev`, und Flags; daneben JSON mit Kopf (INFO, STATUS, Parameter, Lücken, Reboot-Erkennung, ggf. Abbruchgrund).
 - Hilfsfunktionen: |H(f)|, Gruppenlaufzeit, Zeitachse `t_n`, mechanischer Winkel aus elektrischem Winkel und Polpaaren.
 
 ## 10. Tests ohne Hardware
@@ -308,3 +310,4 @@ Reihenfolge und Prüfschritte stehen in `docs/mcsa_capture_flashing.md`. Kurz:
 
 - 2026-10-13, Codex (Design-Review): CIC-Überläufe modular definiert; Sample-Print-Sendethread und `SEND_LAST_SAMPLES` abgesichert; gemeinsamer Mutex auch für `READ`; Winkelanker je `READ`; Abbruch bei Offset-/Konfigurationsänderung; idempotenter `START`, Sitzung und Laufzeit in jeder Antwort; ISR-Dauer am ISR-Ende gemessen; Flag-Kanal für Rohkanal-Gültigkeit; FIR-Hinweis korrigiert; Indexgrenze; typisierte Union statt Zeiger.
 - 2026-10-13, Umsetzung: Client liegt in `mcsa_client/` statt `tools/`, weil `tools/` im bldc-Repo der (ignorierte) Toolchain-Ordner von `make arm_sdk_install` ist.
+- 2026-10-13, Abschluss-Review (Claude Opus + Codex): Sample-Print-Übernahme löscht MCSA-Daten; Stoppgrund `ANGLE_STEP`; Konfigurationshook auch am Ende; Client verwirft veraltete `READ`-Antworten, bricht bei Reboot ab (Tick-Überlauf ausgenommen), stoppt bei Abbruch, erkennt Token-Kollisionen, schreibt den Winkel exakt; `offsetof`-Asserts.
