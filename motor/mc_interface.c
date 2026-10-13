@@ -39,6 +39,7 @@
 #include "crc.h"
 #include "bms.h"
 #include "events.h"
+#include "mcsa_capture.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -99,17 +100,18 @@ static volatile motor_if_state_t m_motor_2;
 #endif
 
 // Sampling variables
-#define ADC_SAMPLE_MAX_LEN		2000
-__attribute__((section(".ram4"))) static volatile int16_t m_curr0_samples[ADC_SAMPLE_MAX_LEN];
-__attribute__((section(".ram4"))) static volatile int16_t m_curr1_samples[ADC_SAMPLE_MAX_LEN];
-__attribute__((section(".ram4"))) static volatile int16_t m_ph1_samples[ADC_SAMPLE_MAX_LEN];
-__attribute__((section(".ram4"))) static volatile int16_t m_ph2_samples[ADC_SAMPLE_MAX_LEN];
-__attribute__((section(".ram4"))) static volatile int16_t m_ph3_samples[ADC_SAMPLE_MAX_LEN];
-__attribute__((section(".ram4"))) static volatile int16_t m_vzero_samples[ADC_SAMPLE_MAX_LEN];
-__attribute__((section(".ram4"))) static volatile uint8_t m_status_samples[ADC_SAMPLE_MAX_LEN];
-__attribute__((section(".ram4"))) static volatile int16_t m_curr_fir_samples[ADC_SAMPLE_MAX_LEN];
-__attribute__((section(".ram4"))) static volatile int16_t m_f_sw_samples[ADC_SAMPLE_MAX_LEN];
-__attribute__((section(".ram4"))) static volatile int8_t m_phase_samples[ADC_SAMPLE_MAX_LEN];
+#define ADC_SAMPLE_MAX_LEN		MCSA_SP_SAMPLE_LEN
+// The sample arrays share their memory with the MCSA capture (mcsa_capture.h)
+#define m_curr0_samples			(mcsa_capture_shared.sp.curr0)
+#define m_curr1_samples			(mcsa_capture_shared.sp.curr1)
+#define m_ph1_samples			(mcsa_capture_shared.sp.ph1)
+#define m_ph2_samples			(mcsa_capture_shared.sp.ph2)
+#define m_ph3_samples			(mcsa_capture_shared.sp.ph3)
+#define m_vzero_samples			(mcsa_capture_shared.sp.vzero)
+#define m_status_samples		(mcsa_capture_shared.sp.status)
+#define m_curr_fir_samples		(mcsa_capture_shared.sp.curr_fir)
+#define m_f_sw_samples			(mcsa_capture_shared.sp.f_sw)
+#define m_phase_samples			(mcsa_capture_shared.sp.phase)
 
 static volatile int m_sample_len;
 static volatile int m_sample_int;
@@ -120,6 +122,9 @@ static volatile int m_sample_now;
 static volatile int m_sample_trigger;
 static volatile float m_last_adc_duration_sample;
 static volatile bool m_sample_is_second_motor;
+// Requests to the sample send thread and the last request it has served
+static volatile uint32_t m_sample_send_req;
+static volatile uint32_t m_sample_send_done;
 static volatile gnss_data m_gnss = {0};
 
 typedef struct {
@@ -155,6 +160,8 @@ static THD_WORKING_AREA(stat_thread_wa, 512);
 static THD_FUNCTION(stat_thread, arg);
 
 void mc_interface_init(void) {
+	mcsa_capture_init();
+
 	memset((void*)&m_motor_1, 0, sizeof(motor_if_state_t));
 #ifdef HW_HAS_DUAL_MOTORS
 	memset((void*)&m_motor_2, 0, sizeof(motor_if_state_t));
@@ -179,6 +186,8 @@ void mc_interface_init(void) {
 	m_sample_mode = DEBUG_SAMPLING_OFF;
 	m_sample_mode_last = DEBUG_SAMPLING_OFF;
 	m_sample_is_second_motor = false;
+	m_sample_send_req = 0;
+	m_sample_send_done = 0;
 
 	mc_interface_stat_reset();
 
@@ -301,6 +310,8 @@ const volatile mc_configuration* mc_interface_get_configuration(void) {
 
 void mc_interface_set_configuration(mc_configuration *configuration) {
 	volatile motor_if_state_t *motor = motor_now();
+
+	mcsa_capture_config_changed();
 
 #if defined HW_HAS_DUAL_MOTORS || defined HW_HAS_DUAL_PARALLEL
 	configuration->motor_type = MOTOR_TYPE_FOC;
@@ -1483,15 +1494,27 @@ float mc_interface_get_last_sample_adc_isr_duration(void) {
 	return m_last_adc_duration_sample;
 }
 
-void mc_interface_sample_print_data(debug_sampling_mode mode, uint16_t len, uint8_t decimation, bool raw, 
+void mc_interface_sample_print_data(debug_sampling_mode mode, uint16_t len, uint8_t decimation, bool raw,
 		void(*reply_func)(unsigned char *data, unsigned int len)) {
+
+	mcsa_capture_lock();
+
+	// The buffer is shared with the MCSA capture
+	if (!mcsa_capture_sample_print_request(mode)) {
+		mcsa_capture_unlock();
+		return;
+	}
 
 	if (len > ADC_SAMPLE_MAX_LEN) {
 		len = ADC_SAMPLE_MAX_LEN;
 	}
 
 	if (mode == DEBUG_SAMPLING_SEND_LAST_SAMPLES) {
-		chEvtSignal(sample_send_tp, (eventmask_t) 1);
+		chSysLock();
+		m_sample_send_req++;
+		chEvtSignalI(sample_send_tp, (eventmask_t) 1);
+		chSchRescheduleS();
+		chSysUnlock();
 	} else {
 		m_sample_trigger = -1;
 		m_sample_now = 0;
@@ -1504,6 +1527,18 @@ void mc_interface_sample_print_data(debug_sampling_mode mode, uint16_t len, uint
 		m_sample_is_second_motor = motor_now() == &m_motor_2;
 #endif
 	}
+
+	mcsa_capture_unlock();
+}
+
+/**
+ * True while COMM_SAMPLE_PRINT records or its send thread still reads the buffer.
+ */
+bool mc_interface_sample_print_busy(void) {
+	chSysLock();
+	bool busy = m_sample_mode != DEBUG_SAMPLING_OFF || m_sample_send_req != m_sample_send_done;
+	chSysUnlock();
+	return busy;
 }
 
 /**
@@ -2012,6 +2047,7 @@ void mc_interface_mc_timer_isr(bool is_second_motor) {
 			m_sample_mode = DEBUG_SAMPLING_OFF;
 			m_sample_mode_last = DEBUG_SAMPLING_NOW;
 			chSysLockFromISR();
+			m_sample_send_req++;
 			chEvtSignalI(sample_send_tp, (eventmask_t) 1);
 			chSysUnlockFromISR();
 		} else {
@@ -2028,6 +2064,7 @@ void mc_interface_mc_timer_isr(bool is_second_motor) {
 			m_sample_mode_last = m_sample_mode;
 			m_sample_mode = DEBUG_SAMPLING_OFF;
 			chSysLockFromISR();
+			m_sample_send_req++;
 			chEvtSignalI(sample_send_tp, (eventmask_t) 1);
 			chSysUnlockFromISR();
 		}
@@ -2051,6 +2088,7 @@ void mc_interface_mc_timer_isr(bool is_second_motor) {
 
 			if (m_sample_mode == DEBUG_SAMPLING_TRIGGER_START) {
 				chSysLockFromISR();
+				m_sample_send_req++;
 				chEvtSignalI(sample_send_tp, (eventmask_t) 1);
 				chSysUnlockFromISR();
 			}
@@ -2081,6 +2119,7 @@ void mc_interface_mc_timer_isr(bool is_second_motor) {
 
 			if (m_sample_mode == DEBUG_SAMPLING_TRIGGER_FAULT) {
 				chSysLockFromISR();
+				m_sample_send_req++;
 				chEvtSignalI(sample_send_tp, (eventmask_t) 1);
 				chSysUnlockFromISR();
 			}
@@ -2784,65 +2823,77 @@ static THD_FUNCTION(sample_send_thread, arg) {
 	for(;;) {
 		chEvtWaitAny((eventmask_t) 1);
 
-		int len = 0;
-		int offset = 0;
+		for (;;) {
+			chSysLock();
+			uint32_t req = m_sample_send_req;
+			chSysUnlock();
 
-		switch (m_sample_mode_last) {
-		case DEBUG_SAMPLING_NOW:
-		case DEBUG_SAMPLING_START:
-			len = m_sample_len;
-			break;
-
-		case DEBUG_SAMPLING_TRIGGER_START:
-		case DEBUG_SAMPLING_TRIGGER_FAULT:
-		case DEBUG_SAMPLING_TRIGGER_START_NOSEND:
-		case DEBUG_SAMPLING_TRIGGER_FAULT_NOSEND:
-			len = ADC_SAMPLE_MAX_LEN;
-			offset = m_sample_trigger - m_sample_len;
-			break;
-
-		default:
-			break;
-		}
-
-		for (int i = 0;i < len;i++) {
-			uint8_t buffer[40];
-			int32_t index = 0;
-			int ind_samp = i + offset;
-
-			while (ind_samp >= ADC_SAMPLE_MAX_LEN) {
-				ind_samp -= ADC_SAMPLE_MAX_LEN;
+			if (req == m_sample_send_done) {
+				break;
 			}
 
-			while (ind_samp < 0) {
-				ind_samp += ADC_SAMPLE_MAX_LEN;
+			int len = 0;
+			int offset = 0;
+
+			switch (m_sample_mode_last) {
+			case DEBUG_SAMPLING_NOW:
+			case DEBUG_SAMPLING_START:
+				len = m_sample_len;
+				break;
+
+			case DEBUG_SAMPLING_TRIGGER_START:
+			case DEBUG_SAMPLING_TRIGGER_FAULT:
+			case DEBUG_SAMPLING_TRIGGER_START_NOSEND:
+			case DEBUG_SAMPLING_TRIGGER_FAULT_NOSEND:
+				len = ADC_SAMPLE_MAX_LEN;
+				offset = m_sample_trigger - m_sample_len;
+				break;
+
+			default:
+				break;
 			}
 
-			buffer[index++] = COMM_SAMPLE_PRINT;
+			for (int i = 0;i < len;i++) {
+				uint8_t buffer[40];
+				int32_t index = 0;
+				int ind_samp = i + offset;
 
-			if (m_sample_raw) {
-				buffer_append_float32_auto(buffer, (float)m_curr0_samples[ind_samp], &index);
-				buffer_append_float32_auto(buffer, (float)m_curr1_samples[ind_samp], &index);
-				buffer_append_float32_auto(buffer, (float)m_ph1_samples[ind_samp], &index);
-				buffer_append_float32_auto(buffer, (float)m_ph2_samples[ind_samp], &index);
-				buffer_append_float32_auto(buffer, (float)m_ph3_samples[ind_samp], &index);
-				buffer_append_float32_auto(buffer, (float)m_vzero_samples[ind_samp], &index);
-				buffer_append_float32_auto(buffer, (float)m_curr_fir_samples[ind_samp], &index);
-			} else {
-				buffer_append_float32_auto(buffer, (float)m_curr0_samples[ind_samp] * FAC_CURRENT, &index);
-				buffer_append_float32_auto(buffer, (float)m_curr1_samples[ind_samp] * FAC_CURRENT, &index);
-				buffer_append_float32_auto(buffer, ((float)m_ph1_samples[ind_samp] / 4096.0 * V_REG) * ((VIN_R1 + VIN_R2) / VIN_R2) * ADC_VOLTS_PH_FACTOR, &index);
-				buffer_append_float32_auto(buffer, ((float)m_ph2_samples[ind_samp] / 4096.0 * V_REG) * ((VIN_R1 + VIN_R2) / VIN_R2) * ADC_VOLTS_PH_FACTOR, &index);
-				buffer_append_float32_auto(buffer, ((float)m_ph3_samples[ind_samp] / 4096.0 * V_REG) * ((VIN_R1 + VIN_R2) / VIN_R2) * ADC_VOLTS_PH_FACTOR, &index);
-				buffer_append_float32_auto(buffer, ((float)m_vzero_samples[ind_samp] / 4096.0 * V_REG) * ((VIN_R1 + VIN_R2) / VIN_R2) * ADC_VOLTS_INPUT_FACTOR, &index);
-				buffer_append_float32_auto(buffer, (float)m_curr_fir_samples[ind_samp] / (8.0 / FAC_CURRENT), &index);
+				while (ind_samp >= ADC_SAMPLE_MAX_LEN) {
+					ind_samp -= ADC_SAMPLE_MAX_LEN;
+				}
+
+				while (ind_samp < 0) {
+					ind_samp += ADC_SAMPLE_MAX_LEN;
+				}
+
+				buffer[index++] = COMM_SAMPLE_PRINT;
+
+				if (m_sample_raw) {
+					buffer_append_float32_auto(buffer, (float)m_curr0_samples[ind_samp], &index);
+					buffer_append_float32_auto(buffer, (float)m_curr1_samples[ind_samp], &index);
+					buffer_append_float32_auto(buffer, (float)m_ph1_samples[ind_samp], &index);
+					buffer_append_float32_auto(buffer, (float)m_ph2_samples[ind_samp], &index);
+					buffer_append_float32_auto(buffer, (float)m_ph3_samples[ind_samp], &index);
+					buffer_append_float32_auto(buffer, (float)m_vzero_samples[ind_samp], &index);
+					buffer_append_float32_auto(buffer, (float)m_curr_fir_samples[ind_samp], &index);
+				} else {
+					buffer_append_float32_auto(buffer, (float)m_curr0_samples[ind_samp] * FAC_CURRENT, &index);
+					buffer_append_float32_auto(buffer, (float)m_curr1_samples[ind_samp] * FAC_CURRENT, &index);
+					buffer_append_float32_auto(buffer, ((float)m_ph1_samples[ind_samp] / 4096.0 * V_REG) * ((VIN_R1 + VIN_R2) / VIN_R2) * ADC_VOLTS_PH_FACTOR, &index);
+					buffer_append_float32_auto(buffer, ((float)m_ph2_samples[ind_samp] / 4096.0 * V_REG) * ((VIN_R1 + VIN_R2) / VIN_R2) * ADC_VOLTS_PH_FACTOR, &index);
+					buffer_append_float32_auto(buffer, ((float)m_ph3_samples[ind_samp] / 4096.0 * V_REG) * ((VIN_R1 + VIN_R2) / VIN_R2) * ADC_VOLTS_PH_FACTOR, &index);
+					buffer_append_float32_auto(buffer, ((float)m_vzero_samples[ind_samp] / 4096.0 * V_REG) * ((VIN_R1 + VIN_R2) / VIN_R2) * ADC_VOLTS_INPUT_FACTOR, &index);
+					buffer_append_float32_auto(buffer, (float)m_curr_fir_samples[ind_samp] / (8.0 / FAC_CURRENT), &index);
+				}
+
+				buffer_append_float32_auto(buffer, (float)m_f_sw_samples[ind_samp] * 10.0, &index);
+				buffer[index++] = m_status_samples[ind_samp];
+				buffer[index++] = m_phase_samples[ind_samp];
+
+				send_func_sample(buffer, index);
 			}
 
-			buffer_append_float32_auto(buffer, (float)m_f_sw_samples[ind_samp] * 10.0, &index);
-			buffer[index++] = m_status_samples[ind_samp];
-			buffer[index++] = m_phase_samples[ind_samp];
-
-			send_func_sample(buffer, index);
+			m_sample_send_done = req;
 		}
 	}
 }

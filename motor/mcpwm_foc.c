@@ -23,6 +23,7 @@
 
 #include "mcpwm_foc.h"
 #include "mc_interface.h"
+#include "mcsa_capture.h"
 #include "ch.h"
 #include "hal.h"
 #include "stm32f4xx_conf.h"
@@ -3308,6 +3309,34 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 	palSetPad(AD2S1205_SAMPLE_GPIO, AD2S1205_SAMPLE_PIN);
 #endif
 
+	// MCSA capture: revolution counter and samples (motor 1 only)
+#ifdef HW_HAS_DUAL_MOTORS
+	const bool mcsa_motor_1 = !is_second_motor;
+#else
+	const bool mcsa_motor_1 = true;
+#endif
+	if (mcsa_motor_1) {
+		mcsa_capture_isr_angle(motor_now->m_motor_state.phase);
+
+		if (mcsa_capture_isr_wants_sample()) {
+			mcsa_sample_in mcsa_in;
+			for (int i = 0; i < 3; i++) {
+				mcsa_in.adc[i] = motor_now->m_currents_adc[i];
+				mcsa_in.offset[i] = conf_now->foc_offsets_current[i];
+			}
+			mcsa_in.id = motor_now->m_motor_state.id;
+			mcsa_in.iq = motor_now->m_motor_state.iq;
+			mcsa_in.vd = motor_now->m_motor_state.vd;
+			mcsa_in.vq = motor_now->m_motor_state.vq;
+			mcsa_in.ccr[0] = TIM1->CCR1;
+			mcsa_in.ccr[1] = TIM1->CCR2;
+			mcsa_in.ccr[2] = TIM1->CCR3;
+			mcsa_in.arr = TIM1->ARR;
+			mcsa_in.running = motor_now->m_state == MC_STATE_RUNNING;
+			mcsa_capture_isr_sample(&mcsa_in);
+		}
+	}
+
 #ifdef HW_HAS_DUAL_MOTORS
 	mc_interface_mc_timer_isr(is_second_motor);
 #else
@@ -3316,6 +3345,7 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 
 	m_isr_motor = 0;
 	m_last_adc_isr_duration = timer_seconds_elapsed_since(t_start);
+	mcsa_capture_isr_end(m_last_adc_isr_duration);
 }
 
 // Private functions

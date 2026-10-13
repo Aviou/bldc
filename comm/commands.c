@@ -21,6 +21,7 @@
 #include "ch.h"
 #include "hal.h"
 #include "mc_interface.h"
+#include "mcsa_capture.h"
 #include "stm32f4xx_conf.h"
 #include "servo_simple.h"
 #include "buffer.h"
@@ -766,6 +767,11 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 	} break;
 
 	case COMM_CUSTOM_APP_DATA:
+		// MCSA capture commands start with their own magic, everything else passes on
+		if (mcsa_capture_process_cmd(data, len, reply_func)) {
+			break;
+		}
+
 		if (appdata_func) {
 			appdata_func(data, len);
 		}
