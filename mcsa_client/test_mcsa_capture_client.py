@@ -150,3 +150,111 @@ def test_info_and_status(rig):
     assert info['buffer_bytes'] == 40000 and info['git_hash'] == 'testlib'
     s = client.status()
     assert s['state'] == mc.STATE_IDLE and s['session'] == 0
+
+
+NOWAIT = lambda dt: None
+
+
+def ramp_ok(rec, idx):
+    """Shunt a ist eine Rampe (Zählwert mod 100): Werte passen exakt zum Index."""
+    ia = rec[:, 0].astype(int) // 8
+    assert np.all(rec[:, 0] % 8 == 0)
+    base = (ia[0] - idx[0]) % 100
+    assert np.all(ia == (base + idx) % 100)
+
+
+@pytest.mark.parametrize('can_id', [None, 3])
+def test_oneshot_capture_direct_and_via_can(rig, can_id):
+    client, t, sim = rig(can_id=can_id, feed_per_request=2000)
+    info, s, rec = client.capture(mask=0x0083, decimation=1, length=500, wait=NOWAIT)
+    idx, recs, ang = rec.arrays()
+    assert s['state'] == mc.STATE_DONE and s['stop_reason'] == 1
+    assert list(idx) == list(range(500)) and rec.gaps == []
+    ramp_ok(recs, idx)
+    # Winkel: 200 Hz bei 30 kHz, R = 1
+    step = 200.0 / 30000.0 * 8192.0
+    assert np.allclose(np.diff(ang), step, atol=1.0)
+
+
+def test_stream_with_overruns_keeps_exact_indices_and_angle(rig):
+    # Ring 800 B, Maske ia+Winkel -> 200 Datensätze; 150 neue je Anfrage, höchstens 120 je READ
+    client, t, sim = rig(buf_bytes=800, feed_per_request=150)
+    ticks = iter(range(10 ** 6))
+    info, s, rec = client.stream(mask=0x0081, decimation=1, seconds=60,
+                                 clock=lambda: next(ticks), wait=NOWAIT)
+    idx, recs, ang = rec.arrays()
+    assert rec.gaps, 'der Test muss Überläufe erzeugen'
+    final = s['n_written']
+    covered = set(idx.tolist())
+    for a, b in rec.gaps:
+        assert a < b
+        assert not covered.intersection(range(a, b))
+        covered.update(range(a, b))
+    assert covered == set(range(final))
+    ramp_ok(recs, idx)
+    step = 200.0 / 30000.0 * 8192.0
+    assert np.allclose(ang - ang[0], (idx - idx[0]) * step, atol=2.0)
+
+
+def test_lost_start_response_does_not_restart(rig):
+    client, t, sim = rig(feed_per_request=2000)
+    t.lose_response_of.add(mc.CMD_START)
+    info, s, rec = client.capture(mask=0x0001, decimation=1, length=100, wait=NOWAIT)
+    assert s['session'] == 1
+    assert len(rec.arrays()[0]) == 100
+
+
+def test_lost_read_response_is_repeated(rig):
+    client, t, sim = rig(feed_per_request=2000)
+    st = client.start(mc.MODE_ONESHOT, 0x0001, 1, 50)
+    client.status()
+    t.lose_response_of.add(mc.CMD_READ)
+    status, r = client.read(st['session'], 0)
+    assert status == mc.OK and r['count'] == 50
+
+
+def test_reboot_is_detected_and_stream_aborts(rig, lib):
+    client, t, sim = rig(feed_per_request=100)
+    ticks = iter(range(10 ** 6))
+
+    def clock():
+        k = next(ticks)
+        if k == 20:
+            lib.mcsa_tl_reboot(t.h)
+            t.uptime = 0
+        return k
+
+    with pytest.raises(mc.ProtocolError, match='Reboot'):
+        client.stream(mask=0x0001, decimation=1, seconds=1000, clock=clock, wait=NOWAIT)
+    assert client.reboots == 1
+
+
+def test_start_refused_while_sample_print_busy(rig, lib):
+    client, t, sim = rig()
+    lib.mcsa_tl_set_sample_print_busy(t.h, 1)
+    with pytest.raises(mc.ProtocolError, match='BUSY'):
+        client.start(mc.MODE_ONESHOT, 0x0087, 10)
+
+
+def test_offset_check_at_standstill(rig, lib):
+    client, t, sim = rig(feed_per_request=5000, f_e=0.0, levels=(2048, 2049, 2046))
+    lib.mcsa_tl_set_offsets(t.h, 2047.5, 2048.0, 2046.0)
+    r = client.offset_check(decimation=10, length=200, threshold=1.5, wait=NOWAIT)
+    assert r['residual_counts'] == pytest.approx([0.5, 1.0, 0.0], abs=1e-9)
+    assert r['warning'] is False
+    r = client.offset_check(decimation=10, length=200, threshold=0.75, wait=NOWAIT)
+    assert r['warning'] is True
+
+
+def test_write_outputs(rig, tmp_path):
+    client, t, sim = rig(feed_per_request=2000)
+    info, s, rec = client.capture(mask=0x0187, decimation=10, length=100, wait=NOWAIT)
+    prefix = str(tmp_path / 'm1')
+    mc.write_outputs(prefix, info, s, rec, {'mode': 'capture'}, client)
+    lines = open(prefix + '.csv').read().splitlines()
+    assert lines[0] == 'index,t_s,ia_A,ib_A,ic_A,angle_el_rev,flags'
+    assert len(lines) == 101
+    import json
+    meta = json.load(open(prefix + '.json'))
+    assert meta['records'] == 100 and meta['gaps'] == []
+    assert meta['cic']['group_delay_s'] == pytest.approx(13.5 / 30000.0)

@@ -295,3 +295,187 @@ class McsaClient:
                 return OK, {'start': start_r, 'count': n, 'rec_bytes': rec_bytes,
                             'anchor': anchor, 'data': data}
         raise ProtocolError('READ: CRC-Fehler trotz Wiederholung')
+
+    def _check_session(self, expected, actual):
+        if actual != expected:
+            if self.reboots:
+                raise ProtocolError('Controller-Reboot erkannt, Aufnahme verloren')
+            raise ProtocolError('Sitzung hat gewechselt (anderer Client?)')
+
+    def _fetch(self, rec, session, start, end):
+        nxt = start
+        while nxt < end:
+            status, r = self.read(session, nxt)
+            if status == OK:
+                if r['count'] == 0:
+                    raise ProtocolError('READ lieferte vor dem Ende keine Daten')
+                rec.add_block(r['start'], r['data'], r['anchor'])
+                nxt += r['count']
+            elif status == OVERWRITTEN:
+                rec.gaps.append((nxt, r['oldest']))
+                nxt = r['oldest']
+            else:
+                self._check_session(session, r['session'])
+                raise ProtocolError(f'READ: {STATUS_NAMES[status]}')
+        return rec
+
+    def capture(self, mask=MASK_DEFAULT, decimation=10, length=0, poll=0.05, wait=time.sleep):
+        """Einzelaufnahme: starten, auf Ende warten, vollständig abholen."""
+        info = self.info()
+        st = self.start(MODE_ONESHOT, mask, decimation, length)
+        n = length or st['capacity']
+        timeout = (n + CIC_ORDER) * decimation / info['f_isr'] + 5.0
+        t0 = time.monotonic()
+        while True:
+            s = self.status()
+            self._check_session(st['session'], s['session'])
+            if s['state'] != STATE_RUNNING:
+                break
+            if time.monotonic() - t0 > timeout:
+                raise TimeoutError('Einzelaufnahme wird nicht fertig')
+            wait(poll)
+        rec = Recording(mask, decimation, info['f_isr'])
+        self._fetch(rec, st['session'], 0, s['n_written'])
+        return info, s, rec
+
+    def stream(self, mask=MASK_DEFAULT, decimation=10, seconds=10.0, idle=0.002,
+               clock=time.monotonic, wait=time.sleep):
+        """Daueraufnahme: fortlaufend abholen, nach `seconds` stoppen und den Rest holen."""
+        info = self.info()
+        st = self.start(MODE_CONTINUOUS, mask, decimation)
+        session = st['session']
+        rec = Recording(mask, decimation, info['f_isr'])
+        t_end = clock() + seconds
+        nxt, final = 0, None
+        while final is None or nxt < final:
+            if final is None and clock() >= t_end:
+                status, final, _ = self.stop(session)
+                if status != OK:
+                    self._check_session(session, -1)
+                continue
+            status, r = self.read(session, nxt)
+            if status == OK:
+                if r['count'] == 0:
+                    wait(idle)
+                    continue
+                rec.add_block(r['start'], r['data'], r['anchor'])
+                nxt += r['count']
+            elif status == OVERWRITTEN:
+                rec.gaps.append((nxt, r['oldest']))
+                nxt = r['oldest']
+            else:
+                self._check_session(session, r['session'] if self.reboots == 0 else -1)
+                raise ProtocolError(f'READ: {STATUS_NAMES[status]}')
+        s = self.status()
+        return info, s, rec
+
+    def offset_check(self, decimation=10, length=1000, threshold=1.5, wait=time.sleep):
+        """Rest-Offset der drei Shunts im Stillstand, in ADC-Stufen."""
+        info, s, rec = self.capture(0x0007, decimation, length, wait=wait)
+        _, recs, _ = rec.arrays()
+        resid = recs.astype(float).mean(axis=0) / 8.0
+        return {'offsets': s['offsets'], 'residual_counts': resid.tolist(),
+                'residual_amp': (resid * info['fac_current']).tolist(),
+                'threshold_counts': threshold,
+                'warning': bool(np.any(np.abs(resid) > threshold))}
+
+
+def to_table(rec, status):
+    idx, recs, ang = rec.arrays()
+    cols = {'index': idx, 't_s': record_times(idx, rec.decimation, rec.f_isr)}
+    for j, ch in enumerate(rec.channels):
+        x = recs[:, j]
+        if ch in ('ia', 'ib', 'ic', 'id', 'iq'):
+            cols[ch + '_A'] = x.astype(float) * status['amp_per_unit']
+        elif ch in ('vd', 'vq'):
+            cols[ch + '_V'] = x.astype(float) / 1000.0
+        elif ch == 'angle':
+            cols['angle_el_rev'] = ang.astype(float) / 8192.0
+        elif ch == 'flags':
+            cols['flags'] = x.astype(np.uint16)
+    return cols
+
+
+def _json_default(o):
+    return o.item() if hasattr(o, 'item') else str(o)
+
+
+def write_outputs(prefix, info, status, rec, params, client):
+    cols = to_table(rec, status)
+    names = list(cols)
+    table = np.column_stack([np.asarray(cols[n], dtype=float) for n in names]) if len(cols['index']) \
+        else np.zeros((0, len(names)))
+    np.savetxt(prefix + '.csv', table, delimiter=',', header=','.join(names), comments='', fmt='%.9g')
+    meta = {
+        'info': info,
+        'status': status,
+        'params': params,
+        'channels': rec.channels,
+        'records': int(len(cols['index'])),
+        'gaps': [list(g) for g in rec.gaps],
+        'reboots': client.reboots,
+        'cic': {'order': CIC_ORDER, 'decimation': rec.decimation, 'f_isr': rec.f_isr,
+                'group_delay_s': CIC_ORDER * (rec.decimation - 1) / 2.0 / rec.f_isr},
+    }
+    with open(prefix + '.json', 'w') as f:
+        json.dump(meta, f, indent=2, default=_json_default)
+
+
+def _summary(s, rec):
+    idx = rec.arrays()[0]
+    missing = sum(b - a for a, b in rec.gaps)
+    return (f"{len(idx)} Datensätze, {len(rec.gaps)} Lücken ({missing} fehlend), "
+            f"Stoppgrund {STOP_NAMES[s['stop_reason']]}, ISR max {s['isr_us_capture_max']:.1f} µs "
+            f"(ohne Aufnahme {s['isr_us_idle_max']:.1f} µs), Sättigungen {s['saturated']}")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description='MCSA-Aufnahme vom VESC (COMM_CUSTOM_APP_DATA)')
+    p.add_argument('port', help='z. B. /dev/ttyACM0')
+    p.add_argument('--can', type=int, default=None, help='CAN-ID des Controllers hinter der Bridge')
+    p.add_argument('--timeout', type=float, default=1.0, help='Antwort-Zeitlimit je Anfrage in s')
+    sub = p.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('info')
+    sub.add_parser('status')
+    pc = sub.add_parser('capture', help='Einzelaufnahme')
+    pc.add_argument('--mask', type=lambda v: int(v, 0), default=MASK_DEFAULT)
+    pc.add_argument('--decimation', type=int, default=10)
+    pc.add_argument('--length', type=int, default=0, help='0 = ganzer Puffer')
+    pc.add_argument('--out', required=True, help='Präfix für .csv und .json')
+    ps = sub.add_parser('stream', help='Daueraufnahme')
+    ps.add_argument('--mask', type=lambda v: int(v, 0), default=MASK_DEFAULT)
+    ps.add_argument('--decimation', type=int, default=10)
+    ps.add_argument('--seconds', type=float, required=True)
+    ps.add_argument('--out', required=True)
+    po = sub.add_parser('offset-check', help='Rest-Offset im Stillstand')
+    po.add_argument('--decimation', type=int, default=10)
+    po.add_argument('--length', type=int, default=1000)
+    po.add_argument('--threshold', type=float, default=1.5, help='Warnschwelle in ADC-Stufen')
+    args = p.parse_args(argv)
+
+    transport = SerialTransport(args.port, args.can, args.timeout)
+    client = McsaClient(transport)
+    try:
+        if args.cmd == 'info':
+            print(json.dumps(client.info(), indent=2))
+        elif args.cmd == 'status':
+            print(json.dumps(client.status(), indent=2, default=_json_default))
+        elif args.cmd == 'capture':
+            info, s, rec = client.capture(args.mask, args.decimation, args.length)
+            write_outputs(args.out, info, s, rec, vars(args), client)
+            print(_summary(s, rec), file=sys.stderr)
+        elif args.cmd == 'stream':
+            info, s, rec = client.stream(args.mask, args.decimation, args.seconds)
+            write_outputs(args.out, info, s, rec, vars(args), client)
+            print(_summary(s, rec), file=sys.stderr)
+        elif args.cmd == 'offset-check':
+            r = client.offset_check(args.decimation, args.length, args.threshold)
+            print(json.dumps(r, indent=2))
+            return 1 if r['warning'] else 0
+    finally:
+        transport.close()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
