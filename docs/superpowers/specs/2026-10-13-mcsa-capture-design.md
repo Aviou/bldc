@@ -83,8 +83,8 @@ mc_interface.c
 | `motor/mc_interface.c` | Puffer-Makros, Sende-Zähler, `mc_interface_sample_print_busy()`, Sperre in `mc_interface_sample_print_data()`, Aufruf bei Konfigurationsänderung, `mcsa_capture_init()` |
 | `motor/motor.mk` | neue Quelldateien |
 | `tests/mcsa_core/` | PC-Tests des Kerns (C, ohne externe Bibliotheken) und gemeinsame Bibliothek für die Python-Tests |
-| `tools/mcsa_capture_client.py` | Referenzclient (pyserial, numpy) |
-| `tools/test_mcsa_capture_client.py` | Tests des Clients, u. a. gegen den Kern per ctypes |
+| `mcsa_client/mcsa_capture_client.py` | Referenzclient (pyserial, numpy) |
+| `mcsa_client/test_mcsa_capture_client.py` | Tests des Clients, u. a. gegen den Kern per ctypes |
 | `docs/mcsa_capture_protocol.md` | Protokoll |
 | `docs/mcsa_capture_flashing.md` | Flash- und Rückweg-Anleitung |
 
@@ -262,7 +262,7 @@ Transport: `COMM_CUSTOM_APP_DATA` (= 36), über USB direkt oder per `COMM_FORWAR
 - Abschätzung für die Standardmaske: unter 1 µs im Mittel, unter 2 µs bei Ausgabewerten. Budget je Durchlauf bei 30 kHz: 33 µs. Nachweis nur über die Messung am Gerät (`STATUS`), mit Standardmaske und voller Maske.
 - Kein Gleitkomma-`lrintf` in der ISR (Wandlung per Typumwandlung mit eigener Rundung), keine Allokation, keine blockierenden Aufrufe, keine Interruptsperre in der ISR.
 
-## 9. Host-Client `tools/mcsa_capture_client.py`
+## 9. Host-Client `mcsa_client/mcsa_capture_client.py`
 
 - Abhängigkeiten: `pyserial`, `numpy`. Framing und CRC wie `scripts/mcsa/vesc_sampleprint.py` (motorpi).
 - Transport: USB direkt oder `--can ID`. Port exklusiv, immer nur eine offene Anfrage, Zeitüberschreitung mit Wiederholung (`START` mit demselben Token).
@@ -283,7 +283,7 @@ Transport: `COMM_CUSTOM_APP_DATA` (= 36), über USB direkt oder per `COMM_FORWAR
    - Ring: `ONESHOT` stoppt bei L; `CONTINUOUS` überschreibt; `READ` → `OVERWRITTEN` mit korrektem ältesten Index, auch bei Überschreiben während der Kopie (Test-Hook); Winkelanker nach Überlauf korrekt.
    - Protokoll: alle Befehle, zu kurze Anfragen, falsches Magic (nicht verarbeitet), falsche Version, unbekannter Befehl, `START` bei laufender Aufnahme, idempotenter `START`, Sample-Print belegt, `STOP` fremde Sitzung, `READ` fremde Sitzung, `READ` am Ende (Anzahl 0), CRC.
    - Flag-Kanal: hohe Modulation einer Phase setzt ihr Bit für 3·R Durchläufe.
-2. **Python-Tests** (`pytest tools/`): CRC-Testvektor, Framing kurz/lang, Pack/Unpack, Winkel-Abwicklung mit Anker, |H|; Ende-zu-Ende gegen den als Bibliothek übersetzten Kern über einen simulierten Transport: Einzelaufnahme direkt und über CAN-Weiterleitung, Daueraufnahme mit erzwungenen Überläufen (Lücken exakt), verlorene `START`-Antwort (Wiederholung startet nicht neu), Reboot-Erkennung, Offset-Prüfung.
+2. **Python-Tests** (`pytest mcsa_client/`): CRC-Testvektor, Framing kurz/lang, Pack/Unpack, Winkel-Abwicklung mit Anker, |H|; Ende-zu-Ende gegen den als Bibliothek übersetzten Kern über einen simulierten Transport: Einzelaufnahme direkt und über CAN-Weiterleitung, Daueraufnahme mit erzwungenen Überläufen (Lücken exakt), verlorene `START`-Antwort (Wiederholung startet nicht neu), Reboot-Erkennung, Offset-Prüfung.
 3. **Firmware-Build** `make fw_60` ohne neue Warnungen; Map-Prüfung (`.ram4`-Belegung, Abstand zur Grenze, Größe des Kernzustands).
 
 ## 11. Am Prüfstand (Nutzer, nach dem Flashen)
@@ -307,3 +307,4 @@ Reihenfolge und Prüfschritte stehen in `docs/mcsa_capture_flashing.md`. Kurz:
 ## 13. Review-Verlauf
 
 - 2026-10-13, Codex (Design-Review): CIC-Überläufe modular definiert; Sample-Print-Sendethread und `SEND_LAST_SAMPLES` abgesichert; gemeinsamer Mutex auch für `READ`; Winkelanker je `READ`; Abbruch bei Offset-/Konfigurationsänderung; idempotenter `START`, Sitzung und Laufzeit in jeder Antwort; ISR-Dauer am ISR-Ende gemessen; Flag-Kanal für Rohkanal-Gültigkeit; FIR-Hinweis korrigiert; Indexgrenze; typisierte Union statt Zeiger.
+- 2026-10-13, Umsetzung: Client liegt in `mcsa_client/` statt `tools/`, weil `tools/` im bldc-Repo der (ignorierte) Toolchain-Ordner von `make arm_sdk_install` ist.

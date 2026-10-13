@@ -1,6 +1,6 @@
 # Host tests for motor/mcsa_core.c
 #   make test   build and run the C tests
-#   make lib    shared library for tools/test_mcsa_capture_client.py
+#   make lib    shared library for mcsa_client/test_mcsa_capture_client.py
 
 TOP    := ../..
 CC     ?= cc
