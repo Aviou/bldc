@@ -108,7 +108,8 @@ typedef enum {
 	MCSA_STOP_CONFIG_CHANGED,
 	MCSA_STOP_INDEX_LIMIT,
 	MCSA_STOP_ANGLE_LIMIT,
-	MCSA_STOP_SAMPLE_PRINT
+	MCSA_STOP_SAMPLE_PRINT,
+	MCSA_STOP_ANGLE_STEP		// 4 or more electrical revolutions between two records
 } mcsa_stop_reason;
 
 typedef enum {

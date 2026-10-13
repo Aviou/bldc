@@ -410,6 +410,9 @@ void mc_interface_set_configuration(mc_configuration *configuration) {
 	}
 
 	bms_init(&configuration->bms);
+
+	// A capture started while the configuration changed ends as well
+	mcsa_capture_config_changed();
 }
 
 bool mc_interface_dccal_done(void) {

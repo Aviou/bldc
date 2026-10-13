@@ -838,6 +838,60 @@ static void test_protocol_read(void) {
 	e.read_copy_hook = NULL;
 }
 
+// ---------------- Final review fixes ----------------
+
+static bool buf_all_zero(void) {
+	for (uint32_t i = 0; i < BUF_BYTES / 2; i++) {
+		if (g_buf[i] != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void test_sample_print_takeover_clears_mcsa_data(void) {
+	mcsa_core c;
+	new_core(&c, BUF_BYTES);
+	sim_t s = sim_default();
+	s.ramp = true;
+	s.offset[0] = 2000.0f;
+	s.f_e = 150.0;
+	start_ok(&c, MCSA_MODE_ONESHOT, 0x0087, 1, 0);
+	sim_run_until_done(&c, &s);
+	CHECK(!buf_all_zero());
+
+	// The first sample print recording after a capture must not leave MCSA bytes behind
+	CHECK(mcsa_core_sample_print_request(&c, MCSA_SP_RECORD));
+	CHECK(buf_all_zero());
+
+	// Later requests while sample print owns the buffer do not clear it again
+	g_buf[0] = 123;
+	CHECK(mcsa_core_sample_print_request(&c, MCSA_SP_RECORD));
+	CHECK(mcsa_core_sample_print_request(&c, MCSA_SP_SEND_LAST));
+	CHECK_EQ(g_buf[0], 123);
+}
+
+static void test_angle_step_limit(void) {
+	// Unwrapping needs less than 4 electrical revolutions between records
+	const double fe[3] = {2000.0, -2000.0, 1800.0};
+	for (int d = 0; d < 3; d++) {
+		mcsa_core c;
+		new_core(&c, BUF_BYTES);
+		sim_t s = sim_default();
+		s.f_e = fe[d];
+		start_ok(&c, MCSA_MODE_CONTINUOUS, 0x0080, 64, 0);
+		sim_run(&c, &s, 64 * 20);
+		if (fabs(fe[d]) * 64.0 / F_ISR >= 4.0) {
+			CHECK_EQ(c.state, MCSA_STATE_DONE);
+			CHECK_EQ(c.stop_reason, MCSA_STOP_ANGLE_STEP);
+			CHECK_EQ(c.n_written, 1);
+		} else {
+			CHECK(mcsa_core_running(&c));
+			CHECK_EQ(c.n_written, 18);
+		}
+	}
+}
+
 int main(void) {
 	test_crc16();
 	test_angle_counter();
@@ -857,6 +911,8 @@ int main(void) {
 	test_protocol_info();
 	test_protocol_start_status_stop();
 	test_protocol_read();
+	test_sample_print_takeover_clears_mcsa_data();
+	test_angle_step_limit();
 
 	printf("%d Pruefungen, %d Fehler\n", g_checks, g_failed);
 	return g_failed == 0 ? 0 : 1;

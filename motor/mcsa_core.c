@@ -340,6 +340,12 @@ bool mcsa_core_sample_print_request(mcsa_core *c, mcsa_sp_request req) {
 		break;
 	}
 
+	// First recording after a capture: clear the MCSA data, so that sample
+	// print never sends it, not even from slots its recording did not reach
+	if (!c->sp_valid) {
+		memset((void *)c->buf, 0, c->buf_words * sizeof(int16_t));
+	}
+
 	mcsa_core_invalidate(c, MCSA_STOP_SAMPLE_PRINT);
 	c->sp_valid = true;
 	return true;
@@ -471,6 +477,13 @@ void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 			return;
 		}
 		int64_t q13 = floor_div8(c->theta_start + rel);
+		// The 16-bit angle can only be unwrapped below 4 revolutions per record
+		int64_t step = q13 - c->last_angle_q13;
+		if (c->n_written > 0 && (step >= 32768 || step <= -32768)) {
+			c->stop_reason = MCSA_STOP_ANGLE_STEP;
+			c->state = MCSA_STATE_DONE;
+			return;
+		}
 		val[MCSA_CH_ANGLE] = (int16_t)(uint16_t)((uint64_t)q13 & 0xFFFFu);
 		c->last_angle_q13 = q13;
 	}

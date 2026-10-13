@@ -19,6 +19,7 @@
 
 #include "mcsa_capture.h"
 
+#include <stddef.h>
 #include <string.h>
 
 #include "ch.h"
@@ -33,6 +34,10 @@
 
 _Static_assert(sizeof(mcsa_sp_layout) == 36000, "COMM_SAMPLE_PRINT layout must be 36000 bytes");
 _Static_assert(sizeof(mcsa_shared_buffer) == MCSA_CAPTURE_BUF_BYTES, "shared buffer size");
+_Static_assert(offsetof(mcsa_sp_layout, curr1) == 4000 && offsetof(mcsa_sp_layout, vzero) == 20000 &&
+		offsetof(mcsa_sp_layout, status) == 24000 && offsetof(mcsa_sp_layout, curr_fir) == 26000 &&
+		offsetof(mcsa_sp_layout, f_sw) == 30000 && offsetof(mcsa_sp_layout, phase) == 34000,
+		"COMM_SAMPLE_PRINT arrays must be packed without padding");
 _Static_assert(PACKET_MAX_PL_LEN - 1 >= MCSA_RESP_MIN, "response buffer too small");
 
 __attribute__((section(".ram4"), aligned(8))) volatile mcsa_shared_buffer mcsa_capture_shared;
@@ -87,6 +92,12 @@ bool mcsa_capture_process_cmd(unsigned char *data, unsigned int len,
 		return false;
 	}
 
+	uint8_t *buf = mempools_get_packet_buffer();
+	buf[0] = COMM_CUSTOM_APP_DATA;
+
+	mcsa_capture_lock();
+
+	// Read the environment under the lock, after any concurrent START or configuration change
 	const volatile mc_configuration *conf = mc_interface_get_configuration();
 
 	mcsa_env env;
@@ -101,10 +112,6 @@ bool mcsa_capture_process_cmd(unsigned char *data, unsigned int len,
 	env.lock_isr = lock_isr;
 	env.unlock_isr = unlock_isr;
 
-	uint8_t *buf = mempools_get_packet_buffer();
-	buf[0] = COMM_CUSTOM_APP_DATA;
-
-	mcsa_capture_lock();
 	int n = mcsa_core_process(&m_core, &env, data, len, buf + 1, PACKET_MAX_PL_LEN - 1);
 	mcsa_capture_unlock();
 
