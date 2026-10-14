@@ -78,13 +78,10 @@ void mcsa_tl_feed(void *h, uint32_t n, const float *phase, const float *a0, cons
 		mcsa_core_update_angle(&t->core, phase[i]);
 		if (mcsa_core_running(&t->core)) {
 			mcsa_sample_in in;
+			float adc[3] = {a0[i], a1[i], a2[i]};
 			memset(&in, 0, sizeof(in));
-			in.adc[0] = a0[i];
-			in.adc[1] = a1[i];
-			in.adc[2] = a2[i];
-			for (int k = 0; k < 3; k++) {
-				in.offset[k] = t->offsets[k];
-			}
+			in.adc = adc;
+			in.offset = t->offsets;
 			in.arr = 2800;
 			in.running = running != 0;
 			mcsa_core_sample(&t->core, &in);

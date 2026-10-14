@@ -106,7 +106,8 @@ void mcsa_capture_init(void) {
 			0, terminal_perf);
 }
 
-void mcsa_capture_perf_add(uint32_t cyc_angle, uint32_t cyc_fill, uint32_t cyc_sample, bool output) {
+__attribute__((section(".ramtext"))) void mcsa_capture_perf_add(uint32_t cyc_angle, uint32_t cyc_fill,
+		uint32_t cyc_sample, bool output) {
 	volatile perf_cat *p = &m_perf[output ? 1 : 0];
 	p->count++;
 	p->sum_sample += cyc_sample;

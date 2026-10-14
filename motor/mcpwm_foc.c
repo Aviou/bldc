@@ -3329,20 +3329,23 @@ static void adc_int_handler(void *p, uint32_t flags) {
 		uint32_t mcsa_c1 = DWT->CYCCNT;
 
 		if (mcsa_capture_isr_wants_sample()) {
+			// Only what the mask needs: every word costs ISR time under load
 			mcsa_sample_in mcsa_in;
-			for (int i = 0; i < 3; i++) {
-				mcsa_in.adc[i] = motor_now->m_currents_adc[i];
-				mcsa_in.offset[i] = conf_now->foc_offsets_current[i];
+			mcsa_in.adc = motor_now->m_currents_adc;
+			mcsa_in.offset = conf_now->foc_offsets_current;
+			if (mcsa_capture_core.use_dq) {
+				mcsa_in.id = motor_now->m_motor_state.id;
+				mcsa_in.iq = motor_now->m_motor_state.iq;
+				mcsa_in.vd = motor_now->m_motor_state.vd;
+				mcsa_in.vq = motor_now->m_motor_state.vq;
 			}
-			mcsa_in.id = motor_now->m_motor_state.id;
-			mcsa_in.iq = motor_now->m_motor_state.iq;
-			mcsa_in.vd = motor_now->m_motor_state.vd;
-			mcsa_in.vq = motor_now->m_motor_state.vq;
-			mcsa_in.ccr[0] = TIM1->CCR1;
-			mcsa_in.ccr[1] = TIM1->CCR2;
-			mcsa_in.ccr[2] = TIM1->CCR3;
-			mcsa_in.arr = TIM1->ARR;
-			mcsa_in.running = motor_now->m_state == MC_STATE_RUNNING;
+			if (mcsa_capture_core.use_flags) {
+				mcsa_in.ccr[0] = TIM1->CCR1;
+				mcsa_in.ccr[1] = TIM1->CCR2;
+				mcsa_in.ccr[2] = TIM1->CCR3;
+				mcsa_in.arr = TIM1->ARR;
+				mcsa_in.running = motor_now->m_state == MC_STATE_RUNNING;
+			}
 			uint32_t mcsa_c2 = DWT->CYCCNT;
 			uint32_t mcsa_out = mcsa_capture_core.pushed;
 			mcsa_capture_isr_sample(&mcsa_in);

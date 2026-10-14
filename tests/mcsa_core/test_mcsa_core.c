@@ -145,7 +145,10 @@ static void sim_step(mcsa_core *c, sim_t *s) {
 
 	if (mcsa_core_running(c)) {
 		mcsa_sample_in in;
+		float adc[3];
 		memset(&in, 0, sizeof(in));
+		in.adc = adc;
+		in.offset = s->offset;
 		for (int k = 0; k < 3; k++) {
 			double v = (double)s->offset[k] + s->dc[k]
 					+ s->amp * cos(th + s->phi - k * TWO_PI_D / 3.0)
@@ -153,8 +156,7 @@ static void sim_step(mcsa_core *c, sim_t *s) {
 			if (k == 0 && s->ramp) {
 				v = (double)s->offset[0] + fmod(s->t, 1000.0);
 			}
-			in.adc[k] = (float)floor(v + 0.5);
-			in.offset[k] = s->offset[k];
+			adc[k] = (float)floor(v + 0.5);
 			in.ccr[k] = s->ccr[k];
 		}
 		in.arr = s->arr;
@@ -1074,6 +1076,21 @@ static void test_commands_drain_one_batch_while_running(void) {
 	CHECK_EQ(be32(b + 16), 80 - MCSA_DROP_OUTPUTS);
 }
 
+static void test_start_tells_which_inputs_are_needed(void) {
+	// The FOC ISR fills id/iq/vd/vq and reads the timer registers only when the mask needs them
+	const struct { uint16_t mask; bool dq; bool flags; } cases[] = {
+		{0x0087, false, false}, {0x0001, false, false}, {0x0008, true, false},
+		{0x0040, true, false}, {0x0100, false, true}, {0x01FF, true, true},
+	};
+	for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		mcsa_core c;
+		new_core(&c, BUF_BYTES);
+		start_ok(&c, MCSA_MODE_ONESHOT, cases[i].mask, 10, 100);
+		CHECK_EQ(c.use_dq, cases[i].dq);
+		CHECK_EQ(c.use_flags, cases[i].flags);
+	}
+}
+
 int main(void) {
 	test_crc16();
 	test_angle_counter();
@@ -1102,6 +1119,7 @@ int main(void) {
 	test_stop_drains_pending_records();
 	test_drain_is_bounded_per_call();
 	test_commands_drain_one_batch_while_running();
+	test_start_tells_which_inputs_are_needed();
 
 	printf("%d Pruefungen, %d Fehler\n", g_checks, g_failed);
 	return g_failed == 0 ? 0 : 1;

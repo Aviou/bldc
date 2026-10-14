@@ -123,10 +123,11 @@ typedef enum {
 	MCSA_SP_SEND_LAST		// Resend of the last COMM_SAMPLE_PRINT recording
 } mcsa_sp_request;
 
-// Input of one FOC ISR cycle while a capture is running
+// Input of one FOC ISR cycle while a capture is running. The ISR fills id..vq only if
+// use_dq is set and ccr..running only if use_flags is set (mcsa_core_start sets both).
 typedef struct {
-	float adc[3];			// Raw ADC counts of the shunts, before offset and reconstruction
-	float offset[3];		// Current offsets in ADC counts
+	const float *adc;		// [3] Raw ADC counts of the shunts, before offset and reconstruction
+	const float *offset;	// [3] Current offsets in ADC counts
 	float id;				// A
 	float iq;				// A
 	float vd;				// V
@@ -168,6 +169,8 @@ typedef struct {
 	bool need_init;
 	uint8_t mode;
 	uint16_t mask;
+	bool use_dq;					// The mask contains id, iq, vd or vq
+	bool use_flags;					// The mask contains the flag channel
 	uint8_t nch;
 	uint8_t angle_pos;
 	uint8_t ch_list[MCSA_CH_NUM];

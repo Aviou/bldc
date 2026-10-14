@@ -25,6 +25,14 @@
 #define ANGLE_UNITS_PER_RAD		(65536.0f / TWO_PI_F)
 #define IDLE_WINDOW				30000
 
+// The hooks of the FOC ISR run from SRAM: no flash wait states, and they do not evict the
+// FOC code from the 1 KB flash cache (ART), which made the whole ISR slower under load.
+#if defined(__arm__)
+#define MCSA_RAMFUNC			__attribute__((section(".ramtext")))
+#else
+#define MCSA_RAMFUNC
+#endif
+
 static inline __attribute__((always_inline)) int32_t round_to_i32(float x) {
 	if (!(x == x)) {
 		return 0;
@@ -202,7 +210,7 @@ void mcsa_core_init(mcsa_core *c, volatile int16_t *buf, uint32_t buf_bytes,
 	c->angle_pos = MCSA_ANGLE_NONE;
 }
 
-void mcsa_core_update_angle(mcsa_core *c, float phase) {
+MCSA_RAMFUNC void mcsa_core_update_angle(mcsa_core *c, float phase) {
 	// The comparison also rejects NaN
 	if (!(phase > -1000.0f && phase < 1000.0f)) {
 		return;
@@ -282,6 +290,8 @@ mcsa_status mcsa_core_start(mcsa_core *c, const mcsa_env *env, uint8_t mode,
 
 	c->mode = mode;
 	c->mask = mask;
+	c->use_dq = (mask & ((1u << MCSA_CH_ID) | (1u << MCSA_CH_IQ) | (1u << MCSA_CH_VD) | (1u << MCSA_CH_VQ))) != 0;
+	c->use_flags = (mask & (1u << MCSA_CH_FLAGS)) != 0;
 	c->nch = 0;
 	c->angle_pos = MCSA_ANGLE_NONE;
 	for (uint8_t ch = 0; ch < MCSA_CH_NUM; ch++) {
@@ -380,7 +390,7 @@ bool mcsa_core_sample_print_request(mcsa_core *c, mcsa_sp_request req) {
 // Kept minimal: integrators, and every R cycles one FIFO entry with the last integrator
 // stage of each channel. Combs, normalization and records run in mcsa_core_drain().
 
-void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
+MCSA_RAMFUNC void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 	if (c->state != MCSA_STATE_RUNNING || c->isr_halt) {
 		return;
 	}
@@ -407,7 +417,7 @@ void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 			cic32_push(c->cic32_int[k], (uint32_t)((int32_t)in->adc[k] - c->off_int[k]));
 		}
 	}
-	if (mask & ((1u << MCSA_CH_ID) | (1u << MCSA_CH_IQ) | (1u << MCSA_CH_VD) | (1u << MCSA_CH_VQ))) {
+	if (c->use_dq) {
 		if (mask & (1u << MCSA_CH_ID)) {
 			cic64_push(c->cic64_int[0], (uint64_t)(int64_t)round_to_i32(in->id * c->q3_per_amp));
 		}
@@ -425,7 +435,7 @@ void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 		cic64_push(c->cic64_int[4], (uint64_t)(c->theta - c->theta_start));
 	}
 
-	if (mask & (1u << MCSA_CH_FLAGS)) {
+	if (c->use_flags) {
 		// Flags of this cycle, combined over the current decimation window
 		uint16_t fl = 0;
 		for (int k = 0; k < 3; k++) {
@@ -617,7 +627,7 @@ uint32_t mcsa_core_drain(mcsa_core *c, uint32_t max_entries) {
 	return taken;
 }
 
-void mcsa_core_isr_end(mcsa_core *c, float isr_duration) {
+MCSA_RAMFUNC void mcsa_core_isr_end(mcsa_core *c, float isr_duration) {
 	if (c->sampled_this_isr) {
 		c->sampled_this_isr = false;
 		if (isr_duration > c->isr_max_capture) {
