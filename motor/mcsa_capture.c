@@ -90,6 +90,7 @@ typedef struct {
 
 static volatile drain_perf m_drain;
 static uint32_t m_perf_c0, m_perf_isr0;		// Cycle counter and ISR cycles at the last mcsa_perf
+static systime_t m_perf_t0;
 volatile uint32_t mcsa_capture_isr_cyc;
 
 static void terminal_perf(int argc, const char **argv);
@@ -173,14 +174,19 @@ static void terminal_perf(int argc, const char **argv) {
 			"single entry without ISR min %u cyc",
 			(double)((float)d.max_sleep * us), (double)((float)d.max_lock * us),
 			(double)((float)d.max_call * us), (unsigned)(d.min_one == UINT32_MAX ? 0 : d.min_one));
+	// The 32-bit cycle counter wraps after 25.6 s
 	uint32_t c_now = DWT->CYCCNT;
 	uint32_t isr_now = mcsa_capture_isr_cyc;
-	if (m_perf_c0 != 0) {
+	systime_t t_now = chVTGetSystemTimeX();
+	if (m_perf_c0 != 0 && chVTTimeElapsedSinceX(m_perf_t0) < S2ST(20)) {
 		commands_printf("FOC ISR load since the last call: %.1f %%",
 				(double)(100.0f * (float)(isr_now - m_perf_isr0) / (float)(c_now - m_perf_c0)));
+	} else {
+		commands_printf("FOC ISR load: call mcsa_perf again within 20 s");
 	}
 	m_perf_c0 = c_now;
 	m_perf_isr0 = isr_now;
+	m_perf_t0 = t_now;
 	commands_printf("ISR max with capture %.1f us, without %.1f us\n",
 			(double)(mcsa_capture_core.isr_max_capture * 1.0e6f),
 			(double)(mcsa_capture_core.isr_max_idle * 1.0e6f));
