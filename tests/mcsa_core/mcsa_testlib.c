@@ -90,7 +90,7 @@ void mcsa_tl_feed(void *h, uint32_t n, const float *phase, const float *a0, cons
 			mcsa_core_sample(&t->core, &in);
 		}
 		mcsa_core_isr_end(&t->core, 1.0e-5f);
-		mcsa_core_drain(&t->core);		// Like the firmware drain thread
+		mcsa_core_drain(&t->core, UINT32_MAX);		// Like the firmware drain thread
 	}
 }
 

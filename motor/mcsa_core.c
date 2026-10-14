@@ -516,11 +516,14 @@ static void stop_from_drain(mcsa_core *c, mcsa_stop_reason reason) {
 	c->isr_halt = true;
 }
 
-void mcsa_core_drain(mcsa_core *c) {
+uint32_t mcsa_core_drain(mcsa_core *c, uint32_t max_entries) {
 	const uint16_t mask = c->mask;
 	const int32_t r3 = (int32_t)c->r3;
+	const uint32_t head = c->fifo_head;		// Entries pushed later wait for the next call
+	uint32_t taken = 0;
 
-	while (c->fifo_tail != c->fifo_head) {
+	while (c->fifo_tail != head && taken < max_entries) {
+		taken++;
 		uint32_t tail = c->fifo_tail;
 		volatile uint32_t *e = c->fifo + tail * c->entry_words;
 
@@ -579,7 +582,7 @@ void mcsa_core_drain(mcsa_core *c) {
 			if (rel >= MCSA_ANGLE_LIMIT || rel <= -MCSA_ANGLE_LIMIT) {
 				stop_from_drain(c, MCSA_STOP_ANGLE_LIMIT);
 				c->fifo_tail = c->fifo_head;
-				return;
+				return taken;
 			}
 			int64_t q13 = floor_div8(c->theta_start + rel);
 			// The 16-bit angle can only be unwrapped below 4 revolutions per record
@@ -587,7 +590,7 @@ void mcsa_core_drain(mcsa_core *c) {
 			if (c->n_written > 0 && (step >= 32768 || step <= -32768)) {
 				stop_from_drain(c, MCSA_STOP_ANGLE_STEP);
 				c->fifo_tail = c->fifo_head;
-				return;
+				return taken;
 			}
 			val[MCSA_CH_ANGLE] = (int16_t)(uint16_t)((uint64_t)q13 & 0xFFFFu);
 			c->last_angle_q13 = q13;
@@ -603,13 +606,15 @@ void mcsa_core_drain(mcsa_core *c) {
 		if (c->mode == MCSA_MODE_ONESHOT && c->n_written >= c->length) {
 			stop_from_drain(c, MCSA_STOP_LENGTH);
 			c->fifo_tail = c->fifo_head;
-			return;
+			return taken;
 		} else if (c->n_written >= MCSA_MAX_RECORDS) {
 			stop_from_drain(c, MCSA_STOP_INDEX_LIMIT);
 			c->fifo_tail = c->fifo_head;
-			return;
+			return taken;
 		}
 	}
+
+	return taken;
 }
 
 void mcsa_core_isr_end(mcsa_core *c, float isr_duration) {
@@ -694,7 +699,7 @@ static int cmd_stop(mcsa_core *c, const mcsa_env *env, const uint8_t *a, uint32_
 	unlock_isr(env);
 
 	// The ISR no longer pushes; store what is still waiting in the FIFO
-	mcsa_core_drain(c);
+	mcsa_core_drain(c, UINT32_MAX);
 	uint32_t nw = c->n_written;
 	uint8_t reason = c->stop_reason;
 
@@ -705,7 +710,7 @@ static int cmd_stop(mcsa_core *c, const mcsa_env *env, const uint8_t *a, uint32_
 }
 
 static int cmd_status(mcsa_core *c, const mcsa_env *env, uint8_t *r) {
-	mcsa_core_drain(c);
+	mcsa_core_drain(c, UINT32_MAX);
 
 	lock_isr(env);
 	mcsa_state state = c->state;
@@ -760,7 +765,7 @@ static int cmd_read(mcsa_core *c, const mcsa_env *env, const uint8_t *a, uint32_
 	uint32_t start = get_u32(a + 2);
 	uint16_t count = get_u16(a + 6);
 
-	mcsa_core_drain(c);
+	mcsa_core_drain(c, UINT32_MAX);
 
 	lock_isr(env);
 	mcsa_state state = c->state;

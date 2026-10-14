@@ -32,7 +32,19 @@ STATE_IDLE, STATE_RUNNING, STATE_DONE, STATE_INVALID = range(4)
 STATE_NAMES = ['IDLE', 'RUNNING', 'DONE', 'INVALID']
 STOP_NAMES = ['NONE', 'LENGTH', 'STOP_CMD', 'OFFSETS_CHANGED', 'CONFIG_CHANGED',
               'INDEX_LIMIT', 'ANGLE_LIMIT', 'SAMPLE_PRINT', 'ANGLE_STEP',
-              'ISR_OVERLOAD']
+              'ISR_OVERLOAD', 'FIFO_OVERRUN']
+
+
+def _name(names, code):
+    return names[code] if 0 <= code < len(names) else f'UNBEKANNT({code})'
+
+
+def stop_name(code):
+    return _name(STOP_NAMES, code)
+
+
+def status_name(code):
+    return _name(STATUS_NAMES, code)
 MODE_ONESHOT, MODE_CONTINUOUS = 1, 2
 
 CHANNELS = ['ia', 'ib', 'ic', 'id', 'iq', 'vd', 'vq', 'angle', 'flags']
@@ -287,7 +299,7 @@ class McsaClient:
     def info(self):
         hdr, b = self._request(CMD_INFO)
         if hdr['status'] != OK:
-            raise ProtocolError(f"INFO: {STATUS_NAMES[hdr['status']]}")
+            raise ProtocolError(f"INFO: {status_name(hdr['status'])}")
         proto, order, rmax, pp, buf_bytes, f_isr, fac, git = struct.unpack(
             INFO_FMT, b[:struct.calcsize(INFO_FMT)])
         return {'protocol': proto, 'cic_order': order, 'decimation_max': rmax, 'pole_pairs': pp,
@@ -297,7 +309,7 @@ class McsaClient:
     def status(self):
         hdr, b = self._request(CMD_STATUS)
         if hdr['status'] != OK:
-            raise ProtocolError(f"STATUS: {STATUS_NAMES[hdr['status']]}")
+            raise ProtocolError(f"STATUS: {status_name(hdr['status'])}")
         s = dict(zip(STATUS_KEYS, struct.unpack(STATUS_FMT, b[:struct.calcsize(STATUS_FMT)])))
         s['offsets'] = [s.pop('offset0'), s.pop('offset1'), s.pop('offset2')]
         s['session'] = hdr['session']
@@ -313,7 +325,7 @@ class McsaClient:
             args = struct.pack('>BHBIH', mode, mask, decimation, length, tok)
             hdr, b = self._request(CMD_START, args)
             if hdr['status'] != OK:
-                raise ProtocolError(f"START abgelehnt: {STATUS_NAMES[hdr['status']]}")
+                raise ProtocolError(f"START abgelehnt: {status_name(hdr['status'])}")
             if hdr['session'] != before:
                 capacity, rec_bytes, mask_r, dec_r = struct.unpack('>IBHB', b[:8])
                 return {'session': hdr['session'], 'capacity': capacity, 'rec_bytes': rec_bytes,
@@ -323,7 +335,7 @@ class McsaClient:
     def stop(self, session):
         hdr, b = self._request(CMD_STOP, struct.pack('>H', session))
         if len(b) < 5:
-            raise ProtocolError(f"STOP: {STATUS_NAMES[hdr['status']]}")
+            raise ProtocolError(f"STOP: {status_name(hdr['status'])}")
         n_written, reason = struct.unpack('>IB', b[:5])
         return hdr['status'], n_written, reason
 
@@ -348,7 +360,7 @@ class McsaClient:
             hdr, b = self._request(CMD_READ, struct.pack('>HIH', session, start, count), accept)
             if hdr['status'] != OK:
                 if len(b) < 8:
-                    raise ProtocolError(f"READ: {STATUS_NAMES[hdr['status']]}")
+                    raise ProtocolError(f"READ: {status_name(hdr['status'])}")
                 oldest, n_written = struct.unpack('>II', b[:8])
                 return hdr['status'], {'oldest': oldest, 'n_written': n_written,
                                        'session': hdr['session']}
@@ -379,7 +391,7 @@ class McsaClient:
                 return r['oldest'], 0
             return nxt, 0       # veraltete Fehlermeldung, erneut lesen
         self._check_session(session, r['session'] if self.reboots == 0 else -1)
-        raise ProtocolError(f'READ: {STATUS_NAMES[status]}')
+        raise ProtocolError(f'READ: {status_name(status)}')
 
     def capture(self, mask=MASK_DEFAULT, decimation=10, length=0, poll=0.05, wait=time.sleep):
         """Einzelaufnahme: starten, auf Ende warten, vollständig abholen."""
@@ -517,7 +529,7 @@ def _summary(s, rec):
     idx = rec.arrays()[0]
     missing = sum(b - a for a, b in rec.gaps)
     return (f"{len(idx)} Datensätze, {len(rec.gaps)} Lücken ({missing} fehlend), "
-            f"Stoppgrund {STOP_NAMES[s['stop_reason']]}, ISR max {s['isr_us_capture_max']:.1f} µs "
+            f"Stoppgrund {stop_name(s['stop_reason'])}, ISR max {s['isr_us_capture_max']:.1f} µs "
             f"(ohne Aufnahme {s['isr_us_idle_max']:.1f} µs), Sättigungen {s['saturated']}")
 
 
@@ -555,7 +567,7 @@ def main(argv=None):
             print(json.dumps(client.status(), indent=2, default=_json_default))
         elif args.cmd == 'stop':
             status, n_written, reason = client.stop_current()
-            print(f'{STATUS_NAMES[status]}: {n_written} Datensätze, Stoppgrund {STOP_NAMES[reason]}')
+            print(f'{status_name(status)}: {n_written} Datensätze, Stoppgrund {stop_name(reason)}')
         elif args.cmd in ('capture', 'stream'):
             if args.cmd == 'capture':
                 info, s, rec = client.capture(args.mask, args.decimation, args.length)

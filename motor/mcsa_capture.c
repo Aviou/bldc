@@ -48,6 +48,11 @@ __attribute__((section(".ram4"), aligned(8))) volatile mcsa_shared_buffer mcsa_c
 #define MCSA_FIFO_WORDS		448
 __attribute__((section(".ram4"), aligned(4))) static volatile uint32_t m_fifo[MCSA_FIFO_WORDS];
 
+// Entries per drain call. The batches keep the work per call bounded, and the thread yields
+// between them, so the threads of the same priority (among them the watchdog thread) keep
+// running even if the drain only just keeps up with the ISR.
+#define MCSA_DRAIN_BATCH	32
+
 static THD_WORKING_AREA(drain_thread_wa, 512);
 static THD_FUNCTION(drain_thread, arg);
 
@@ -80,7 +85,7 @@ void mcsa_capture_init(void) {
 	chMtxObjectInit(&m_mutex);
 	mcsa_core_init(&mcsa_capture_core, mcsa_capture_shared.mcsa, MCSA_CAPTURE_BUF_BYTES,
 			m_fifo, sizeof(m_fifo));
-	chThdCreateStatic(drain_thread_wa, sizeof(drain_thread_wa), NORMALPRIO + 1, drain_thread, NULL);
+	chThdCreateStatic(drain_thread_wa, sizeof(drain_thread_wa), NORMALPRIO, drain_thread, NULL);
 
 	// Cycle counter for mcsa_perf
 	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -150,11 +155,13 @@ static THD_FUNCTION(drain_thread, arg) {
 
 	for (;;) {
 		chThdSleepMicroseconds(500);
-		if (mcsa_capture_core.fifo_tail != mcsa_capture_core.fifo_head) {
+		uint32_t taken;
+		do {
 			mcsa_capture_lock();
-			mcsa_core_drain(&mcsa_capture_core);
+			taken = mcsa_core_drain(&mcsa_capture_core, MCSA_DRAIN_BATCH);
 			mcsa_capture_unlock();
-		}
+			chThdYield();
+		} while (taken == MCSA_DRAIN_BATCH);
 	}
 }
 

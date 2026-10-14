@@ -423,3 +423,25 @@ def test_abort_hook_runs_on_capture_failure(rig):
     with pytest.raises(mc.CaptureAborted):
         client.capture(mask=0x0001, decimation=1, length=1000, wait=NOWAIT)
     assert called == [1]
+
+
+def _firmware_enum(name):
+    import re
+    with open(os.path.join(HERE, '..', 'motor', 'mcsa_core.h')) as f:
+        hdr = f.read()
+    body = re.search(r'typedef enum \{([^}]*)\} ' + name + ';', hdr).group(1)
+    return re.findall(r'\bMCSA_(\w+)', re.sub(r'//[^\n]*', '', body))
+
+
+def test_name_tables_match_firmware_enums():
+    """Neue Stoppgründe in der Firmware dürfen den Client nicht mit IndexError abbrechen lassen."""
+    stops = [n[len('STOP_'):] for n in _firmware_enum('mcsa_stop_reason')]
+    assert mc.STOP_NAMES == ['STOP_CMD' if n == 'CMD' else n for n in stops]
+    assert mc.STATUS_NAMES == _firmware_enum('mcsa_status')
+
+
+def test_unknown_codes_are_named_not_fatal():
+    """Eine neuere Firmware kann Codes melden, die dieser Client noch nicht kennt."""
+    assert mc.stop_name(10) == 'FIFO_OVERRUN'
+    assert mc.stop_name(99) == 'UNBEKANNT(99)'
+    assert mc.status_name(99) == 'UNBEKANNT(99)'

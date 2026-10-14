@@ -168,7 +168,7 @@ static void sim_step(mcsa_core *c, sim_t *s) {
 
 	mcsa_core_isr_end(c, 1.0e-5f);
 	if (!s->no_drain) {
-		mcsa_core_drain(c);		// The firmware drains from a thread every 0.5 ms
+		mcsa_core_drain(c, UINT32_MAX);		// The firmware drains from a thread every 0.5 ms
 	}
 	s->t += 1.0;
 }
@@ -972,7 +972,7 @@ static void test_fifo_overrun_stops_capture(void) {
 	CHECK_EQ(c.state, MCSA_STATE_DONE);
 	CHECK_EQ(c.stop_reason, MCSA_STOP_FIFO_OVERRUN);
 	CHECK_EQ(c.n_written, 0);
-	mcsa_core_drain(&c);
+	mcsa_core_drain(&c, UINT32_MAX);
 	CHECK_EQ(c.n_written, c.fifo_slots - 1 - MCSA_DROP_OUTPUTS);
 	for (uint32_t n = 0; n < c.n_written; n++) {
 		CHECK_EQ(rec_val(&c, n, 0), 8 * (int)((n + 2) % 1000));
@@ -1019,6 +1019,30 @@ static void test_stop_drains_pending_records(void) {
 	CHECK_EQ(c.n_written, 40);
 }
 
+static void test_drain_is_bounded_per_call(void) {
+	mcsa_core c;
+	new_core(&c, BUF_BYTES);
+	sim_t s = sim_default();
+	s.ramp = true;
+	s.offset[0] = 2000.0f;
+	s.no_drain = true;
+	start_ok(&c, MCSA_MODE_CONTINUOUS, 0x0087, 1, 0);
+	sim_run(&c, &s, 40);
+
+	// The drain thread takes a bounded batch per call, so the watchdog thread is never starved
+	CHECK_EQ(mcsa_core_drain(&c, 10), 10);
+	CHECK_EQ(c.n_written, 10 - MCSA_DROP_OUTPUTS);
+	CHECK_EQ(mcsa_core_drain(&c, 1000), 30);
+	CHECK_EQ(c.n_written, 40 - MCSA_DROP_OUTPUTS);
+	CHECK_EQ(mcsa_core_drain(&c, 1000), 0);
+	CHECK(mcsa_core_running(&c));
+
+	// The records continue seamlessly across the batches
+	for (uint32_t n = 0; n < c.n_written; n++) {
+		CHECK_EQ(rec_val(&c, n, 0), 8 * (int)((n + 2) % 1000));
+	}
+}
+
 int main(void) {
 	test_crc16();
 	test_angle_counter();
@@ -1045,6 +1069,7 @@ int main(void) {
 	test_fifo_overrun_stops_capture();
 	test_isr_halts_after_oneshot_and_status_drains();
 	test_stop_drains_pending_records();
+	test_drain_is_bounded_per_call();
 
 	printf("%d Pruefungen, %d Fehler\n", g_checks, g_failed);
 	return g_failed == 0 ? 0 : 1;
