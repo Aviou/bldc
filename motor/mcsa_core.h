@@ -113,7 +113,8 @@ typedef enum {
 	MCSA_STOP_ANGLE_LIMIT,
 	MCSA_STOP_SAMPLE_PRINT,
 	MCSA_STOP_ANGLE_STEP,		// 4 or more electrical revolutions between two records
-	MCSA_STOP_ISR_OVERLOAD		// FOC ISR with capture longer than MCSA_ISR_LIMIT of its cycle
+	MCSA_STOP_ISR_OVERLOAD,		// FOC ISR with capture longer than MCSA_ISR_LIMIT of its cycle
+	MCSA_STOP_FIFO_OVERRUN		// The drain thread did not keep up with the ISR
 } mcsa_stop_reason;
 
 typedef enum {
@@ -193,7 +194,19 @@ typedef struct {
 	float off_frozen[3];
 	int64_t theta_start;
 	int64_t last_angle_q13;			// Filtered angle of the newest record, 1/8192 revolution
-	uint16_t flags_win[MCSA_CIC_ORDER];
+	uint16_t isr_flags;				// Flags of the current window (ISR)
+	uint16_t flags_hist[MCSA_CIC_ORDER];	// Flags of the last windows (drain)
+
+	// FIFO from the ISR (last integrator stage per output) to the drain thread
+	volatile uint32_t *fifo;
+	uint32_t fifo_words;
+	uint32_t fifo_slots;
+	uint32_t entry_words;
+	volatile uint32_t fifo_head;		// Written by the ISR
+	volatile uint32_t fifo_tail;		// Written by the drain
+	uint32_t pushed;
+	uint32_t push_limit;
+	volatile bool isr_halt;			// All outputs of a one-shot capture are pushed
 	volatile uint32_t saturated;
 
 	// ISR timing in s
@@ -205,9 +218,11 @@ typedef struct {
 	uint32_t isr_idle_cnt;
 } mcsa_core;
 
-void mcsa_core_init(mcsa_core *c, volatile int16_t *buf, uint32_t buf_bytes);
+void mcsa_core_init(mcsa_core *c, volatile int16_t *buf, uint32_t buf_bytes,
+		volatile uint32_t *fifo, uint32_t fifo_bytes);
 void mcsa_core_update_angle(mcsa_core *c, float phase);
 void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in);
+void mcsa_core_drain(mcsa_core *c);
 void mcsa_core_isr_end(mcsa_core *c, float isr_duration);
 mcsa_status mcsa_core_start(mcsa_core *c, const mcsa_env *env, uint8_t mode,
 		uint16_t mask, uint8_t R, uint32_t length, uint16_t token);
@@ -226,6 +241,10 @@ int64_t mcsa_rdiv64(int64_t n, uint32_t d);
 
 static inline bool mcsa_core_running(const mcsa_core *c) {
 	return c->state == MCSA_STATE_RUNNING;
+}
+
+static inline bool mcsa_core_wants_sample(const mcsa_core *c) {
+	return c->state == MCSA_STATE_RUNNING && !c->isr_halt;
 }
 
 #endif /* MCSA_CORE_H_ */

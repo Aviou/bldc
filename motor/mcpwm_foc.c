@@ -3336,11 +3336,11 @@ void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
 			mcsa_in.arr = TIM1->ARR;
 			mcsa_in.running = motor_now->m_state == MC_STATE_RUNNING;
 			uint32_t mcsa_c2 = DWT->CYCCNT;
-			uint32_t mcsa_out = mcsa_capture_core.out_count;
+			uint32_t mcsa_out = mcsa_capture_core.pushed;
 			mcsa_capture_isr_sample(&mcsa_in);
 			uint32_t mcsa_c3 = DWT->CYCCNT;
 			mcsa_capture_perf_add(mcsa_c1 - mcsa_c0, mcsa_c2 - mcsa_c1, mcsa_c3 - mcsa_c2,
-					mcsa_capture_core.out_count != mcsa_out);
+					mcsa_capture_core.pushed != mcsa_out);
 		}
 	}
 

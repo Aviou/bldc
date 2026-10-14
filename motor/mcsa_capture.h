@@ -55,7 +55,8 @@ void mcsa_capture_init(void);
 void mcsa_capture_lock(void);
 void mcsa_capture_unlock(void);
 
-// FOC ISR hooks, motor 1 only; the core functions run from SRAM
+// FOC ISR hooks, motor 1 only. The ISR only integrates and pushes FIFO entries;
+// a thread drains them every 0.5 ms (combs, normalization, records).
 extern mcsa_core mcsa_capture_core;
 
 static inline void mcsa_capture_isr_angle(float phase) {
@@ -63,7 +64,7 @@ static inline void mcsa_capture_isr_angle(float phase) {
 }
 
 static inline bool mcsa_capture_isr_wants_sample(void) {
-	return mcsa_core_running(&mcsa_capture_core);
+	return mcsa_core_wants_sample(&mcsa_capture_core);
 }
 
 static inline void mcsa_capture_isr_sample(const mcsa_sample_in *in) {

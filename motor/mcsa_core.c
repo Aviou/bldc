@@ -21,15 +21,6 @@
 
 #include <string.h>
 
-// The hot paths of the FOC ISR run from SRAM (.ramtext is copied there at startup).
-// From flash they stall on wait states next to the large FOC ISR; measured on HW 60
-// that cost more than the computation itself.
-#if defined(__arm__)
-#define MCSA_FAST				__attribute__((section(".ramtext")))
-#else
-#define MCSA_FAST
-#endif
-
 #define TWO_PI_F				6.28318530717958647692f
 #define ANGLE_UNITS_PER_RAD		(65536.0f / TWO_PI_F)
 #define IDLE_WINDOW				30000
@@ -69,7 +60,7 @@ static inline __attribute__((always_inline)) uint64_t udiv64_small(uint64_t n, u
 	return q;
 }
 
-MCSA_FAST int64_t mcsa_rdiv64(int64_t n, uint32_t d) {
+int64_t mcsa_rdiv64(int64_t n, uint32_t d) {
 	if (d == 1) {
 		return n;
 	}
@@ -104,31 +95,11 @@ static inline __attribute__((always_inline)) void cic32_push(uint32_t *integ, ui
 	}
 }
 
-static inline __attribute__((always_inline)) int32_t cic32_pull(const uint32_t *integ, uint32_t *comb) {
-	uint32_t v = integ[MCSA_CIC_ORDER - 1];
-	for (int s = 0; s < MCSA_CIC_ORDER; s++) {
-		uint32_t prev = comb[s];
-		comb[s] = v;
-		v -= prev;
-	}
-	return (int32_t)v;
-}
-
 static inline __attribute__((always_inline)) void cic64_push(uint64_t *integ, uint64_t x) {
 	for (int s = 0; s < MCSA_CIC_ORDER; s++) {
 		integ[s] += x;
 		x = integ[s];
 	}
-}
-
-static inline __attribute__((always_inline)) int64_t cic64_pull(const uint64_t *integ, uint64_t *comb) {
-	uint64_t v = integ[MCSA_CIC_ORDER - 1];
-	for (int s = 0; s < MCSA_CIC_ORDER; s++) {
-		uint64_t prev = comb[s];
-		comb[s] = v;
-		v -= prev;
-	}
-	return (int64_t)v;
 }
 
 static uint8_t channel_count(uint16_t mask) {
@@ -219,16 +190,19 @@ uint16_t mcsa_crc16(const uint8_t *buf, uint32_t len) {
 	return crc;
 }
 
-void mcsa_core_init(mcsa_core *c, volatile int16_t *buf, uint32_t buf_bytes) {
+void mcsa_core_init(mcsa_core *c, volatile int16_t *buf, uint32_t buf_bytes,
+		volatile uint32_t *fifo, uint32_t fifo_bytes) {
 	memset((void *)c, 0, sizeof(*c));
 	c->buf = buf;
 	c->buf_words = buf_bytes / 2;
+	c->fifo = fifo;
+	c->fifo_words = fifo_bytes / 4;
 	c->sp_valid = true;
 	c->state = MCSA_STATE_IDLE;
 	c->angle_pos = MCSA_ANGLE_NONE;
 }
 
-MCSA_FAST void mcsa_core_update_angle(mcsa_core *c, float phase) {
+void mcsa_core_update_angle(mcsa_core *c, float phase) {
 	// The comparison also rejects NaN
 	if (!(phase > -1000.0f && phase < 1000.0f)) {
 		return;
@@ -265,6 +239,12 @@ mcsa_status mcsa_core_start(mcsa_core *c, const mcsa_env *env, uint8_t mode,
 
 	uint32_t cap = mcsa_core_capacity(c, mask);
 	if (cap == 0) {
+		return MCSA_BAD_ARG;
+	}
+
+	// One FIFO entry: one word per current/flags channel, two per 64-bit channel
+	uint32_t words = channel_count(mask & 0x0107u) + 2u * channel_count(mask & 0x00F8u);
+	if (c->fifo == 0 || c->fifo_words / words < 2) {
 		return MCSA_BAD_ARG;
 	}
 
@@ -325,7 +305,19 @@ mcsa_status mcsa_core_start(mcsa_core *c, const mcsa_env *env, uint8_t mode,
 	memset(c->cic32_comb, 0, sizeof(c->cic32_comb));
 	memset(c->cic64_int, 0, sizeof(c->cic64_int));
 	memset(c->cic64_comb, 0, sizeof(c->cic64_comb));
-	memset(c->flags_win, 0, sizeof(c->flags_win));
+	memset(c->flags_hist, 0, sizeof(c->flags_hist));
+	c->isr_flags = 0;
+	c->entry_words = 0;
+	for (uint8_t i = 0; i < c->nch; i++) {
+		uint8_t ch = c->ch_list[i];
+		c->entry_words += (ch <= MCSA_CH_IC || ch == MCSA_CH_FLAGS) ? 1u : 2u;
+	}
+	c->fifo_slots = c->entry_words ? c->fifo_words / c->entry_words : 0;
+	c->fifo_head = 0;
+	c->fifo_tail = 0;
+	c->pushed = 0;
+	c->push_limit = mode == MCSA_MODE_ONESHOT ? length + MCSA_DROP_OUTPUTS : 0xFFFFFFFFu;
+	c->isr_halt = false;
 	c->in_count = 0;
 	c->out_count = 0;
 	c->last_angle_q13 = 0;
@@ -343,7 +335,7 @@ mcsa_status mcsa_core_start(mcsa_core *c, const mcsa_env *env, uint8_t mode,
 	return MCSA_OK;
 }
 
-MCSA_FAST void mcsa_core_stop(mcsa_core *c, mcsa_stop_reason reason) {
+void mcsa_core_stop(mcsa_core *c, mcsa_stop_reason reason) {
 	if (c->state == MCSA_STATE_RUNNING) {
 		c->stop_reason = (uint8_t)reason;
 		c->state = MCSA_STATE_DONE;
@@ -384,8 +376,12 @@ bool mcsa_core_sample_print_request(mcsa_core *c, mcsa_sp_request req) {
 	return true;
 }
 
-MCSA_FAST void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
-	if (c->state != MCSA_STATE_RUNNING) {
+// ---------------- ISR part ----------------
+// Kept minimal: integrators, and every R cycles one FIFO entry with the last integrator
+// stage of each channel. Combs, normalization and records run in mcsa_core_drain().
+
+void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
+	if (c->state != MCSA_STATE_RUNNING || c->isr_halt) {
 		return;
 	}
 
@@ -403,6 +399,55 @@ MCSA_FAST void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 		c->need_init = false;
 	}
 
+	const uint16_t mask = c->mask;
+
+	// ADC counts are integer-valued floats: plain conversion, no checks needed
+	for (int k = 0; k < 3; k++) {
+		if (mask & (1u << k)) {
+			cic32_push(c->cic32_int[k], (uint32_t)((int32_t)in->adc[k] - c->off_int[k]));
+		}
+	}
+	if (mask & ((1u << MCSA_CH_ID) | (1u << MCSA_CH_IQ) | (1u << MCSA_CH_VD) | (1u << MCSA_CH_VQ))) {
+		if (mask & (1u << MCSA_CH_ID)) {
+			cic64_push(c->cic64_int[0], (uint64_t)(int64_t)round_to_i32(in->id * c->q3_per_amp));
+		}
+		if (mask & (1u << MCSA_CH_IQ)) {
+			cic64_push(c->cic64_int[1], (uint64_t)(int64_t)round_to_i32(in->iq * c->q3_per_amp));
+		}
+		if (mask & (1u << MCSA_CH_VD)) {
+			cic64_push(c->cic64_int[2], (uint64_t)(int64_t)round_to_i32(in->vd * 1000.0f));
+		}
+		if (mask & (1u << MCSA_CH_VQ)) {
+			cic64_push(c->cic64_int[3], (uint64_t)(int64_t)round_to_i32(in->vq * 1000.0f));
+		}
+	}
+	if (mask & (1u << MCSA_CH_ANGLE)) {
+		cic64_push(c->cic64_int[4], (uint64_t)(c->theta - c->theta_start));
+	}
+
+	if (mask & (1u << MCSA_CH_FLAGS)) {
+		// Flags of this cycle, combined over the current decimation window
+		uint16_t fl = 0;
+		for (int k = 0; k < 3; k++) {
+			if (in->arr > MCSA_HIGH_MOD_MARGIN && in->ccr[k] > in->arr - MCSA_HIGH_MOD_MARGIN) {
+				fl |= (uint16_t)(1u << k);
+			}
+		}
+		if (c->in_count == 0) {
+			c->isr_flags = (uint16_t)(fl | MCSA_FLAG_RUNNING);
+		} else {
+			c->isr_flags |= fl;
+		}
+		if (!in->running) {
+			c->isr_flags &= (uint16_t)~MCSA_FLAG_RUNNING;
+		}
+	}
+
+	if (++c->in_count < c->R) {
+		return;
+	}
+	c->in_count = 0;
+
 	for (int k = 0; k < 3; k++) {
 		if (in->offset[k] != c->off_frozen[k]) {
 			c->stop_reason = MCSA_STOP_OFFSETS_CHANGED;
@@ -411,133 +456,163 @@ MCSA_FAST void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 		}
 	}
 
-	const uint16_t mask = c->mask;
-
-	// Flags of this cycle, combined over the current decimation window
-	uint16_t fl = 0;
-	for (int k = 0; k < 3; k++) {
-		if (in->arr > MCSA_HIGH_MOD_MARGIN && in->ccr[k] > in->arr - MCSA_HIGH_MOD_MARGIN) {
-			fl |= (uint16_t)(1u << k);
-		}
-	}
-	if (c->in_count == 0) {
-		c->flags_win[0] = (uint16_t)(fl | MCSA_FLAG_RUNNING);
-	} else {
-		c->flags_win[0] |= fl;
-	}
-	if (!in->running) {
-		c->flags_win[0] &= (uint16_t)~MCSA_FLAG_RUNNING;
-	}
-
-	// Integrators
-	for (int k = 0; k < 3; k++) {
-		if (mask & (1u << k)) {
-			int32_t x = round_to_i32(in->adc[k]) - c->off_int[k];
-			cic32_push(c->cic32_int[k], (uint32_t)x);
-		}
-	}
-	if (mask & (1u << MCSA_CH_ID)) {
-		cic64_push(c->cic64_int[0], (uint64_t)(int64_t)round_to_i32(in->id * c->q3_per_amp));
-	}
-	if (mask & (1u << MCSA_CH_IQ)) {
-		cic64_push(c->cic64_int[1], (uint64_t)(int64_t)round_to_i32(in->iq * c->q3_per_amp));
-	}
-	if (mask & (1u << MCSA_CH_VD)) {
-		cic64_push(c->cic64_int[2], (uint64_t)(int64_t)round_to_i32(in->vd * 1000.0f));
-	}
-	if (mask & (1u << MCSA_CH_VQ)) {
-		cic64_push(c->cic64_int[3], (uint64_t)(int64_t)round_to_i32(in->vq * 1000.0f));
-	}
-	if (mask & (1u << MCSA_CH_ANGLE)) {
-		cic64_push(c->cic64_int[4], (uint64_t)(c->theta - c->theta_start));
-	}
-
-	if (++c->in_count < c->R) {
+	uint32_t head = c->fifo_head;
+	uint32_t next = head + 1 == c->fifo_slots ? 0 : head + 1;
+	if (next == c->fifo_tail) {
+		// The drain did not keep up; a lost entry would break the combs
+		c->stop_reason = MCSA_STOP_FIFO_OVERRUN;
+		c->state = MCSA_STATE_DONE;
 		return;
 	}
-	c->in_count = 0;
 
-	// Combs run for every output, also for the dropped ones
-	// Only the entries of channels in the mask are written and read (no memset from flash)
-	int32_t y32[3];
-	int64_t y64[5];
+	volatile uint32_t *e = c->fifo + head * c->entry_words;
 	for (int k = 0; k < 3; k++) {
 		if (mask & (1u << k)) {
-			y32[k] = cic32_pull(c->cic32_int[k], c->cic32_comb[k]);
+			*e++ = c->cic32_int[k][MCSA_CIC_ORDER - 1];
 		}
 	}
 	for (int j = 0; j < 5; j++) {
 		if (mask & (1u << (MCSA_CH_ID + j))) {
-			y64[j] = cic64_pull(c->cic64_int[j], c->cic64_comb[j]);
+			uint64_t v = c->cic64_int[j][MCSA_CIC_ORDER - 1];
+			*e++ = (uint32_t)v;
+			*e++ = (uint32_t)(v >> 32);
 		}
 	}
+	if (mask & (1u << MCSA_CH_FLAGS)) {
+		*e++ = c->isr_flags;
+	}
+	c->fifo_head = next;
 
-	// The filter spans the last MCSA_CIC_ORDER windows
-	uint16_t hm = 0;
-	uint16_t run = MCSA_FLAG_RUNNING;
-	for (int w = 0; w < MCSA_CIC_ORDER; w++) {
-		hm |= c->flags_win[w] & (MCSA_FLAG_HIGH_MOD_A | MCSA_FLAG_HIGH_MOD_B | MCSA_FLAG_HIGH_MOD_C);
-		run &= c->flags_win[w];
-	}
-	for (int w = MCSA_CIC_ORDER - 1; w > 0; w--) {
-		c->flags_win[w] = c->flags_win[w - 1];
-	}
-
-	if (++c->out_count <= MCSA_DROP_OUTPUTS) {
-		return;
-	}
-
-	int16_t val[MCSA_CH_NUM];		// Only the channels in the mask are set and read
-	const int32_t r3 = (int32_t)c->r3;
-
-	for (int k = 0; k < 3; k++) {
-		if (mask & (1u << k)) {
-			int32_t q = y32[k] / r3;
-			int32_t rem = y32[k] % r3;
-			val[k] = sat16(c, (int64_t)8 * q + rdiv32(8 * rem, r3) - c->off_frac_q3[k]);
-		}
-	}
-	for (int j = 0; j < 4; j++) {
-		if (mask & (1u << (MCSA_CH_ID + j))) {
-			val[MCSA_CH_ID + j] = sat16(c, mcsa_rdiv64(y64[j], c->r3));
-		}
-	}
-	if (mask & (1u << MCSA_CH_ANGLE)) {
-		int64_t rel = mcsa_rdiv64(y64[4], c->r3);
-		if (rel >= MCSA_ANGLE_LIMIT || rel <= -MCSA_ANGLE_LIMIT) {
-			c->stop_reason = MCSA_STOP_ANGLE_LIMIT;
-			c->state = MCSA_STATE_DONE;
-			return;
-		}
-		int64_t q13 = floor_div8(c->theta_start + rel);
-		// The 16-bit angle can only be unwrapped below 4 revolutions per record
-		int64_t step = q13 - c->last_angle_q13;
-		if (c->n_written > 0 && (step >= 32768 || step <= -32768)) {
-			c->stop_reason = MCSA_STOP_ANGLE_STEP;
-			c->state = MCSA_STATE_DONE;
-			return;
-		}
-		val[MCSA_CH_ANGLE] = (int16_t)(uint16_t)((uint64_t)q13 & 0xFFFFu);
-		c->last_angle_q13 = q13;
-	}
-	val[MCSA_CH_FLAGS] = (int16_t)(uint16_t)(hm | run);
-
-	volatile int16_t *rec = c->buf + (c->n_written % c->capacity) * c->nch;
-	for (uint8_t i = 0; i < c->nch; i++) {
-		rec[i] = val[c->ch_list[i]];
-	}
-	c->n_written = c->n_written + 1;
-
-	if (c->mode == MCSA_MODE_ONESHOT && c->n_written >= c->length) {
-		c->stop_reason = MCSA_STOP_LENGTH;
-		c->state = MCSA_STATE_DONE;
-	} else if (c->n_written >= MCSA_MAX_RECORDS) {
-		c->stop_reason = MCSA_STOP_INDEX_LIMIT;
-		c->state = MCSA_STATE_DONE;
+	if (++c->pushed >= c->push_limit) {
+		c->isr_halt = true;
 	}
 }
 
-MCSA_FAST void mcsa_core_isr_end(mcsa_core *c, float isr_duration) {
+// ---------------- Thread part ----------------
+
+static inline __attribute__((always_inline)) int32_t comb32(uint32_t v, uint32_t *comb) {
+	for (int s = 0; s < MCSA_CIC_ORDER; s++) {
+		uint32_t prev = comb[s];
+		comb[s] = v;
+		v -= prev;
+	}
+	return (int32_t)v;
+}
+
+static inline __attribute__((always_inline)) int64_t comb64(uint64_t v, uint64_t *comb) {
+	for (int s = 0; s < MCSA_CIC_ORDER; s++) {
+		uint64_t prev = comb[s];
+		comb[s] = v;
+		v -= prev;
+	}
+	return (int64_t)v;
+}
+
+static void stop_from_drain(mcsa_core *c, mcsa_stop_reason reason) {
+	if (c->state == MCSA_STATE_RUNNING) {
+		c->stop_reason = (uint8_t)reason;
+		c->state = MCSA_STATE_DONE;
+	}
+	c->isr_halt = true;
+}
+
+void mcsa_core_drain(mcsa_core *c) {
+	const uint16_t mask = c->mask;
+	const int32_t r3 = (int32_t)c->r3;
+
+	while (c->fifo_tail != c->fifo_head) {
+		uint32_t tail = c->fifo_tail;
+		volatile uint32_t *e = c->fifo + tail * c->entry_words;
+
+		// Only the entries of channels in the mask are written and read
+		int32_t y32[3];
+		int64_t y64[5];
+		uint16_t fl = 0;
+		for (int k = 0; k < 3; k++) {
+			if (mask & (1u << k)) {
+				y32[k] = comb32(*e++, c->cic32_comb[k]);
+			}
+		}
+		for (int j = 0; j < 5; j++) {
+			if (mask & (1u << (MCSA_CH_ID + j))) {
+				uint64_t v = *e++;
+				v |= (uint64_t)(*e++) << 32;
+				y64[j] = comb64(v, c->cic64_comb[j]);
+			}
+		}
+		if (mask & (1u << MCSA_CH_FLAGS)) {
+			fl = (uint16_t)*e++;
+		}
+		c->fifo_tail = tail + 1 == c->fifo_slots ? 0 : tail + 1;
+
+		// The filter spans the last MCSA_CIC_ORDER windows
+		c->flags_hist[0] = fl;
+		uint16_t hm = 0;
+		uint16_t run = MCSA_FLAG_RUNNING;
+		for (int w = 0; w < MCSA_CIC_ORDER; w++) {
+			hm |= c->flags_hist[w] & (MCSA_FLAG_HIGH_MOD_A | MCSA_FLAG_HIGH_MOD_B | MCSA_FLAG_HIGH_MOD_C);
+			run &= c->flags_hist[w];
+		}
+		for (int w = MCSA_CIC_ORDER - 1; w > 0; w--) {
+			c->flags_hist[w] = c->flags_hist[w - 1];
+		}
+
+		if (++c->out_count <= MCSA_DROP_OUTPUTS) {
+			continue;
+		}
+
+		int16_t val[MCSA_CH_NUM];		// Only the channels in the mask are set and read
+		for (int k = 0; k < 3; k++) {
+			if (mask & (1u << k)) {
+				int32_t q = y32[k] / r3;
+				int32_t rem = y32[k] % r3;
+				val[k] = sat16(c, (int64_t)8 * q + rdiv32(8 * rem, r3) - c->off_frac_q3[k]);
+			}
+		}
+		for (int j = 0; j < 4; j++) {
+			if (mask & (1u << (MCSA_CH_ID + j))) {
+				val[MCSA_CH_ID + j] = sat16(c, mcsa_rdiv64(y64[j], c->r3));
+			}
+		}
+		if (mask & (1u << MCSA_CH_ANGLE)) {
+			int64_t rel = mcsa_rdiv64(y64[4], c->r3);
+			if (rel >= MCSA_ANGLE_LIMIT || rel <= -MCSA_ANGLE_LIMIT) {
+				stop_from_drain(c, MCSA_STOP_ANGLE_LIMIT);
+				c->fifo_tail = c->fifo_head;
+				return;
+			}
+			int64_t q13 = floor_div8(c->theta_start + rel);
+			// The 16-bit angle can only be unwrapped below 4 revolutions per record
+			int64_t step = q13 - c->last_angle_q13;
+			if (c->n_written > 0 && (step >= 32768 || step <= -32768)) {
+				stop_from_drain(c, MCSA_STOP_ANGLE_STEP);
+				c->fifo_tail = c->fifo_head;
+				return;
+			}
+			val[MCSA_CH_ANGLE] = (int16_t)(uint16_t)((uint64_t)q13 & 0xFFFFu);
+			c->last_angle_q13 = q13;
+		}
+		val[MCSA_CH_FLAGS] = (int16_t)(uint16_t)(hm | run);
+
+		volatile int16_t *rec = c->buf + (c->n_written % c->capacity) * c->nch;
+		for (uint8_t i = 0; i < c->nch; i++) {
+			rec[i] = val[c->ch_list[i]];
+		}
+		c->n_written = c->n_written + 1;
+
+		if (c->mode == MCSA_MODE_ONESHOT && c->n_written >= c->length) {
+			stop_from_drain(c, MCSA_STOP_LENGTH);
+			c->fifo_tail = c->fifo_head;
+			return;
+		} else if (c->n_written >= MCSA_MAX_RECORDS) {
+			stop_from_drain(c, MCSA_STOP_INDEX_LIMIT);
+			c->fifo_tail = c->fifo_head;
+			return;
+		}
+	}
+}
+
+void mcsa_core_isr_end(mcsa_core *c, float isr_duration) {
 	if (c->sampled_this_isr) {
 		c->sampled_this_isr = false;
 		if (isr_duration > c->isr_max_capture) {
@@ -616,9 +691,12 @@ static int cmd_stop(mcsa_core *c, const mcsa_env *env, const uint8_t *a, uint32_
 	} else {
 		mcsa_core_stop(c, MCSA_STOP_CMD);
 	}
+	unlock_isr(env);
+
+	// The ISR no longer pushes; store what is still waiting in the FIFO
+	mcsa_core_drain(c);
 	uint32_t nw = c->n_written;
 	uint8_t reason = c->stop_reason;
-	unlock_isr(env);
 
 	int32_t i = put_hdr(c, env, r, MCSA_CMD_STOP, st);
 	put_u32(r, &i, nw);
@@ -627,6 +705,8 @@ static int cmd_stop(mcsa_core *c, const mcsa_env *env, const uint8_t *a, uint32_
 }
 
 static int cmd_status(mcsa_core *c, const mcsa_env *env, uint8_t *r) {
+	mcsa_core_drain(c);
+
 	lock_isr(env);
 	mcsa_state state = c->state;
 	uint8_t reason = c->stop_reason;
@@ -679,6 +759,8 @@ static int cmd_read(mcsa_core *c, const mcsa_env *env, const uint8_t *a, uint32_
 	uint16_t session = get_u16(a);
 	uint32_t start = get_u32(a + 2);
 	uint16_t count = get_u16(a + 6);
+
+	mcsa_core_drain(c);
 
 	lock_isr(env);
 	mcsa_state state = c->state;

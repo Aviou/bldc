@@ -44,6 +44,13 @@ _Static_assert(PACKET_MAX_PL_LEN - 1 >= MCSA_RESP_MIN, "response buffer too smal
 
 __attribute__((section(".ram4"), aligned(8))) volatile mcsa_shared_buffer mcsa_capture_shared;
 
+// FIFO between the FOC ISR and the drain thread; at most 14 words per entry (all channels)
+#define MCSA_FIFO_WORDS		448
+__attribute__((section(".ram4"), aligned(4))) static volatile uint32_t m_fifo[MCSA_FIFO_WORDS];
+
+static THD_WORKING_AREA(drain_thread_wa, 512);
+static THD_FUNCTION(drain_thread, arg);
+
 mcsa_core mcsa_capture_core;
 static mutex_t m_mutex;
 
@@ -71,7 +78,9 @@ static void terminal_perf(int argc, const char **argv);
 
 void mcsa_capture_init(void) {
 	chMtxObjectInit(&m_mutex);
-	mcsa_core_init(&mcsa_capture_core, mcsa_capture_shared.mcsa, MCSA_CAPTURE_BUF_BYTES);
+	mcsa_core_init(&mcsa_capture_core, mcsa_capture_shared.mcsa, MCSA_CAPTURE_BUF_BYTES,
+			m_fifo, sizeof(m_fifo));
+	chThdCreateStatic(drain_thread_wa, sizeof(drain_thread_wa), NORMALPRIO + 1, drain_thread, NULL);
 
 	// Cycle counter for mcsa_perf
 	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -133,6 +142,20 @@ void mcsa_capture_lock(void) {
 
 void mcsa_capture_unlock(void) {
 	chMtxUnlock(&m_mutex);
+}
+
+static THD_FUNCTION(drain_thread, arg) {
+	(void)arg;
+	chRegSetThreadName("MCSA drain");
+
+	for (;;) {
+		chThdSleepMicroseconds(500);
+		if (mcsa_capture_core.fifo_tail != mcsa_capture_core.fifo_head) {
+			mcsa_capture_lock();
+			mcsa_core_drain(&mcsa_capture_core);
+			mcsa_capture_unlock();
+		}
+	}
 }
 
 bool mcsa_capture_process_cmd(unsigned char *data, unsigned int len,

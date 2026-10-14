@@ -29,6 +29,8 @@ static int g_failed = 0;
 #define RESP_MAX	511
 
 static int16_t g_buf[BUF_BYTES / 2];
+#define FIFO_WORDS	448
+static uint32_t g_fifo[FIFO_WORDS];
 static bool g_sp_busy = false;
 
 static float wrap_pi(double x) {
@@ -59,7 +61,8 @@ static __attribute__((unused)) mcsa_env test_env(void) {
 static void new_core(mcsa_core *c, uint32_t buf_bytes) {
 	memset(g_buf, 0, sizeof(g_buf));
 	g_sp_busy = false;
-	mcsa_core_init(c, g_buf, buf_bytes);
+	memset(g_fifo, 0, sizeof(g_fifo));
+	mcsa_core_init(c, g_buf, buf_bytes, g_fifo, sizeof(g_fifo));
 }
 
 // ---------------- Task 1 ----------------
@@ -111,6 +114,7 @@ typedef struct {
 	double f_tone;		// Additional tone on all phases, Hz
 	double a_tone;		// ADC counts
 	bool ramp;			// Raw value of phase a = offset + (t mod 1000)
+	bool no_drain;		// Do not emulate the drain thread
 	uint32_t ccr[3];
 	uint32_t arr;
 	bool running;
@@ -163,6 +167,9 @@ static void sim_step(mcsa_core *c, sim_t *s) {
 	}
 
 	mcsa_core_isr_end(c, 1.0e-5f);
+	if (!s->no_drain) {
+		mcsa_core_drain(c);		// The firmware drains from a thread every 0.5 ms
+	}
 	s->t += 1.0;
 }
 
@@ -950,6 +957,68 @@ static void test_isr_overload_stops_capture(void) {
 	CHECK_EQ(c.stop_reason, MCSA_STOP_ISR_OVERLOAD);
 }
 
+// ---------------- ISR/thread split ----------------
+
+static void test_fifo_overrun_stops_capture(void) {
+	mcsa_core c;
+	new_core(&c, BUF_BYTES);
+	sim_t s = sim_default();
+	s.ramp = true;
+	s.offset[0] = 2000.0f;
+	s.no_drain = true;
+	start_ok(&c, MCSA_MODE_CONTINUOUS, 0x0087, 1, 0);		// 5 words per entry -> 89 slots, 88 usable
+	CHECK_EQ(c.fifo_slots, FIFO_WORDS / 5);
+	sim_run(&c, &s, 200);
+	CHECK_EQ(c.state, MCSA_STATE_DONE);
+	CHECK_EQ(c.stop_reason, MCSA_STOP_FIFO_OVERRUN);
+	CHECK_EQ(c.n_written, 0);
+	mcsa_core_drain(&c);
+	CHECK_EQ(c.n_written, c.fifo_slots - 1 - MCSA_DROP_OUTPUTS);
+	for (uint32_t n = 0; n < c.n_written; n++) {
+		CHECK_EQ(rec_val(&c, n, 0), 8 * (int)((n + 2) % 1000));
+	}
+}
+
+static void test_isr_halts_after_oneshot_and_status_drains(void) {
+	mcsa_core c;
+	new_core(&c, BUF_BYTES);
+	mcsa_env e = test_env();
+	sim_t s = sim_default();
+	s.no_drain = true;
+	start_ok(&c, MCSA_MODE_ONESHOT, 0x0087, 1, 50);
+	sim_run(&c, &s, 100);
+	CHECK(c.isr_halt);
+	CHECK_EQ(c.n_written, 0);
+
+	uint8_t rq[64];
+	uint8_t rs[RESP_MAX];
+	uint32_t l = req(rq, MCSA_CMD_STATUS, NULL, 0);
+	process(&c, &e, rq, l, rs);
+	const uint8_t *b = rs + MCSA_RESP_HDR_LEN;
+	CHECK_EQ(b[0], MCSA_STATE_DONE);
+	CHECK_EQ(b[1], MCSA_STOP_LENGTH);
+	CHECK_EQ(be32(b + 16), 50);
+}
+
+static void test_stop_drains_pending_records(void) {
+	mcsa_core c;
+	new_core(&c, BUF_BYTES);
+	mcsa_env e = test_env();
+	sim_t s = sim_default();
+	s.no_drain = true;
+	start_ok(&c, MCSA_MODE_CONTINUOUS, 0x0087, 1, 0);
+	sim_run(&c, &s, 42);			// 40 records waiting in the FIFO
+	uint8_t rq[64];
+	uint8_t rs[RESP_MAX];
+	uint8_t sa[2] = {0, 1};
+	uint32_t l = req(rq, MCSA_CMD_STOP, sa, 2);
+	process(&c, &e, rq, l, rs);
+	CHECK_EQ(rs[4], MCSA_OK);
+	CHECK_EQ(be32(rs + 11), 40);
+	sim_run(&c, &s, 20);
+	CHECK_EQ(c.n_written, 40);
+}
+
 int main(void) {
 	test_crc16();
 	test_angle_counter();
@@ -973,6 +1042,9 @@ int main(void) {
 	test_angle_step_limit();
 	test_rdiv64_matches_reference();
 	test_isr_overload_stops_capture();
+	test_fifo_overrun_stops_capture();
+	test_isr_halts_after_oneshot_and_status_drains();
+	test_stop_drains_pending_records();
 
 	printf("%d Pruefungen, %d Fehler\n", g_checks, g_failed);
 	return g_failed == 0 ? 0 : 1;

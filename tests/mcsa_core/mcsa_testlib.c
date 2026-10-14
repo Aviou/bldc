@@ -10,6 +10,7 @@ typedef struct {
 	mcsa_env env;
 	int16_t *buf;
 	uint32_t buf_bytes;
+	uint32_t fifo[448];
 	float offsets[3];
 	int sp_busy;
 } mcsa_tl;
@@ -24,7 +25,7 @@ void *mcsa_tl_new(uint32_t buf_bytes) {
 	mcsa_tl *t = calloc(1, sizeof(mcsa_tl));
 	t->buf = calloc(buf_bytes / 2 + 1, sizeof(int16_t));
 	t->buf_bytes = buf_bytes;
-	mcsa_core_init(&t->core, t->buf, buf_bytes);
+	mcsa_core_init(&t->core, t->buf, buf_bytes, t->fifo, sizeof(t->fifo));
 	t->env.f_isr = 30000.0f;
 	t->env.fac_current = 0.0805861f;
 	t->env.pole_pairs = 7;
@@ -66,7 +67,7 @@ void mcsa_tl_set_sample_print_busy(void *h, int busy) {
 void mcsa_tl_reboot(void *h) {
 	mcsa_tl *t = (mcsa_tl *)h;
 	memset(t->buf, 0, t->buf_bytes);
-	mcsa_core_init(&t->core, t->buf, t->buf_bytes);
+	mcsa_core_init(&t->core, t->buf, t->buf_bytes, t->fifo, sizeof(t->fifo));
 	t->env.uptime_ms = 0;
 }
 
@@ -89,6 +90,7 @@ void mcsa_tl_feed(void *h, uint32_t n, const float *phase, const float *a0, cons
 			mcsa_core_sample(&t->core, &in);
 		}
 		mcsa_core_isr_end(&t->core, 1.0e-5f);
+		mcsa_core_drain(&t->core);		// Like the firmware drain thread
 	}
 }
 
