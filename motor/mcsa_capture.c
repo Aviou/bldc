@@ -42,7 +42,7 @@ _Static_assert(PACKET_MAX_PL_LEN - 1 >= MCSA_RESP_MIN, "response buffer too smal
 
 __attribute__((section(".ram4"), aligned(8))) volatile mcsa_shared_buffer mcsa_capture_shared;
 
-static mcsa_core m_core;
+mcsa_core mcsa_capture_core;
 static mutex_t m_mutex;
 
 static void lock_isr(void) {
@@ -59,7 +59,7 @@ static bool buffer_free(void) {
 
 void mcsa_capture_init(void) {
 	chMtxObjectInit(&m_mutex);
-	mcsa_core_init(&m_core, mcsa_capture_shared.mcsa, MCSA_CAPTURE_BUF_BYTES);
+	mcsa_core_init(&mcsa_capture_core, mcsa_capture_shared.mcsa, MCSA_CAPTURE_BUF_BYTES);
 }
 
 void mcsa_capture_lock(void) {
@@ -68,22 +68,6 @@ void mcsa_capture_lock(void) {
 
 void mcsa_capture_unlock(void) {
 	chMtxUnlock(&m_mutex);
-}
-
-void mcsa_capture_isr_angle(float phase) {
-	mcsa_core_update_angle(&m_core, phase);
-}
-
-bool mcsa_capture_isr_wants_sample(void) {
-	return mcsa_core_running(&m_core);
-}
-
-void mcsa_capture_isr_sample(const mcsa_sample_in *in) {
-	mcsa_core_sample(&m_core, in);
-}
-
-void mcsa_capture_isr_end(float isr_duration) {
-	mcsa_core_isr_end(&m_core, isr_duration);
 }
 
 bool mcsa_capture_process_cmd(unsigned char *data, unsigned int len,
@@ -112,7 +96,7 @@ bool mcsa_capture_process_cmd(unsigned char *data, unsigned int len,
 	env.lock_isr = lock_isr;
 	env.unlock_isr = unlock_isr;
 
-	int n = mcsa_core_process(&m_core, &env, data, len, buf + 1, PACKET_MAX_PL_LEN - 1);
+	int n = mcsa_core_process(&mcsa_capture_core, &env, data, len, buf + 1, PACKET_MAX_PL_LEN - 1);
 	mcsa_capture_unlock();
 
 	// Synchronous answer in the context of the incoming packet, also for CAN forwarding
@@ -133,11 +117,11 @@ bool mcsa_capture_sample_print_request(debug_sampling_mode mode) {
 		req = MCSA_SP_SEND_LAST;
 	}
 
-	return mcsa_core_sample_print_request(&m_core, req);
+	return mcsa_core_sample_print_request(&mcsa_capture_core, req);
 }
 
 void mcsa_capture_config_changed(void) {
 	chSysLock();
-	mcsa_core_stop(&m_core, MCSA_STOP_CONFIG_CHANGED);
+	mcsa_core_stop(&mcsa_capture_core, MCSA_STOP_CONFIG_CHANGED);
 	chSysUnlock();
 }

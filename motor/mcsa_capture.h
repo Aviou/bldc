@@ -55,11 +55,24 @@ void mcsa_capture_init(void);
 void mcsa_capture_lock(void);
 void mcsa_capture_unlock(void);
 
-// FOC ISR hooks, motor 1 only
-void mcsa_capture_isr_angle(float phase);
-bool mcsa_capture_isr_wants_sample(void);
-void mcsa_capture_isr_sample(const mcsa_sample_in *in);
-void mcsa_capture_isr_end(float isr_duration);
+// FOC ISR hooks, motor 1 only; the core functions run from SRAM
+extern mcsa_core mcsa_capture_core;
+
+static inline void mcsa_capture_isr_angle(float phase) {
+	mcsa_core_update_angle(&mcsa_capture_core, phase);
+}
+
+static inline bool mcsa_capture_isr_wants_sample(void) {
+	return mcsa_core_running(&mcsa_capture_core);
+}
+
+static inline void mcsa_capture_isr_sample(const mcsa_sample_in *in) {
+	mcsa_core_sample(&mcsa_capture_core, in);
+}
+
+static inline void mcsa_capture_isr_end(float isr_duration) {
+	mcsa_core_isr_end(&mcsa_capture_core, isr_duration);
+}
 
 // Returns true if the COMM_CUSTOM_APP_DATA packet belonged to the MCSA capture
 bool mcsa_capture_process_cmd(unsigned char *data, unsigned int len,

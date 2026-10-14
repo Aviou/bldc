@@ -21,6 +21,15 @@
 
 #include <string.h>
 
+// The hot paths of the FOC ISR run from SRAM (.ramtext is copied there at startup).
+// From flash they stall on wait states next to the large FOC ISR; measured on HW 60
+// that cost more than the computation itself.
+#if defined(__arm__)
+#define MCSA_FAST				__attribute__((section(".ramtext")))
+#else
+#define MCSA_FAST
+#endif
+
 #define TWO_PI_F				6.28318530717958647692f
 #define ANGLE_UNITS_PER_RAD		(65536.0f / TWO_PI_F)
 #define IDLE_WINDOW				30000
@@ -39,13 +48,13 @@ static inline __attribute__((always_inline)) int32_t round_to_i32(float x) {
 }
 
 // Division rounded half away from zero, d > 0
-static int32_t rdiv32(int32_t n, int32_t d) {
+static inline __attribute__((always_inline)) int32_t rdiv32(int32_t n, int32_t d) {
 	return n >= 0 ? (n + d / 2) / d : -((-n + d / 2) / d);
 }
 
 // 64 by 32 bit division for d <= 2^18 in 14-bit steps: the partial remainder stays
 // below 2^18, so every step fits a 32-bit hardware division.
-static uint64_t udiv64_small(uint64_t n, uint32_t d) {
+static inline __attribute__((always_inline)) uint64_t udiv64_small(uint64_t n, uint32_t d) {
 	uint32_t r = (uint32_t)(n >> 56);
 	uint64_t q = r / d;
 	r -= (uint32_t)q * d;
@@ -60,7 +69,7 @@ static uint64_t udiv64_small(uint64_t n, uint32_t d) {
 	return q;
 }
 
-int64_t mcsa_rdiv64(int64_t n, uint32_t d) {
+MCSA_FAST int64_t mcsa_rdiv64(int64_t n, uint32_t d) {
 	if (d == 1) {
 		return n;
 	}
@@ -70,11 +79,11 @@ int64_t mcsa_rdiv64(int64_t n, uint32_t d) {
 	return n >= 0 ? (int64_t)q : -(int64_t)q;
 }
 
-static int64_t floor_div8(int64_t v) {
+static inline __attribute__((always_inline)) int64_t floor_div8(int64_t v) {
 	return v >= 0 ? v / 8 : -((-v + 7) / 8);
 }
 
-static int16_t sat16(mcsa_core *c, int64_t v) {
+static inline __attribute__((always_inline)) int16_t sat16(mcsa_core *c, int64_t v) {
 	if (v > 32767) {
 		c->saturated = c->saturated + 1;
 		return 32767;
@@ -88,14 +97,14 @@ static int16_t sat16(mcsa_core *c, int64_t v) {
 
 // CIC integrators and combs in modular arithmetic. Integrator overflow is
 // well defined and cancels in the combs as long as the comb result fits.
-static void cic32_push(uint32_t *integ, uint32_t x) {
+static inline __attribute__((always_inline)) void cic32_push(uint32_t *integ, uint32_t x) {
 	for (int s = 0; s < MCSA_CIC_ORDER; s++) {
 		integ[s] += x;
 		x = integ[s];
 	}
 }
 
-static int32_t cic32_pull(const uint32_t *integ, uint32_t *comb) {
+static inline __attribute__((always_inline)) int32_t cic32_pull(const uint32_t *integ, uint32_t *comb) {
 	uint32_t v = integ[MCSA_CIC_ORDER - 1];
 	for (int s = 0; s < MCSA_CIC_ORDER; s++) {
 		uint32_t prev = comb[s];
@@ -105,14 +114,14 @@ static int32_t cic32_pull(const uint32_t *integ, uint32_t *comb) {
 	return (int32_t)v;
 }
 
-static void cic64_push(uint64_t *integ, uint64_t x) {
+static inline __attribute__((always_inline)) void cic64_push(uint64_t *integ, uint64_t x) {
 	for (int s = 0; s < MCSA_CIC_ORDER; s++) {
 		integ[s] += x;
 		x = integ[s];
 	}
 }
 
-static int64_t cic64_pull(const uint64_t *integ, uint64_t *comb) {
+static inline __attribute__((always_inline)) int64_t cic64_pull(const uint64_t *integ, uint64_t *comb) {
 	uint64_t v = integ[MCSA_CIC_ORDER - 1];
 	for (int s = 0; s < MCSA_CIC_ORDER; s++) {
 		uint64_t prev = comb[s];
@@ -219,7 +228,7 @@ void mcsa_core_init(mcsa_core *c, volatile int16_t *buf, uint32_t buf_bytes) {
 	c->angle_pos = MCSA_ANGLE_NONE;
 }
 
-void mcsa_core_update_angle(mcsa_core *c, float phase) {
+MCSA_FAST void mcsa_core_update_angle(mcsa_core *c, float phase) {
 	// The comparison also rejects NaN
 	if (!(phase > -1000.0f && phase < 1000.0f)) {
 		return;
@@ -310,6 +319,7 @@ mcsa_status mcsa_core_start(mcsa_core *c, const mcsa_env *env, uint8_t mode,
 	c->f_isr = env->f_isr;
 	c->fac_current = env->fac_current;
 	c->q3_per_amp = env->fac_current > 0.0f ? 8.0f / env->fac_current : 0.0f;
+	c->isr_limit = env->f_isr > 0.0f ? MCSA_ISR_LIMIT / env->f_isr : 0.0f;
 
 	memset(c->cic32_int, 0, sizeof(c->cic32_int));
 	memset(c->cic32_comb, 0, sizeof(c->cic32_comb));
@@ -333,7 +343,7 @@ mcsa_status mcsa_core_start(mcsa_core *c, const mcsa_env *env, uint8_t mode,
 	return MCSA_OK;
 }
 
-void mcsa_core_stop(mcsa_core *c, mcsa_stop_reason reason) {
+MCSA_FAST void mcsa_core_stop(mcsa_core *c, mcsa_stop_reason reason) {
 	if (c->state == MCSA_STATE_RUNNING) {
 		c->stop_reason = (uint8_t)reason;
 		c->state = MCSA_STATE_DONE;
@@ -374,7 +384,7 @@ bool mcsa_core_sample_print_request(mcsa_core *c, mcsa_sp_request req) {
 	return true;
 }
 
-void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
+MCSA_FAST void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 	if (c->state != MCSA_STATE_RUNNING) {
 		return;
 	}
@@ -448,8 +458,9 @@ void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 	c->in_count = 0;
 
 	// Combs run for every output, also for the dropped ones
-	int32_t y32[3] = {0, 0, 0};
-	int64_t y64[5] = {0, 0, 0, 0, 0};
+	// Only the entries of channels in the mask are written and read (no memset from flash)
+	int32_t y32[3];
+	int64_t y64[5];
 	for (int k = 0; k < 3; k++) {
 		if (mask & (1u << k)) {
 			y32[k] = cic32_pull(c->cic32_int[k], c->cic32_comb[k]);
@@ -526,11 +537,15 @@ void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 	}
 }
 
-void mcsa_core_isr_end(mcsa_core *c, float isr_duration) {
+MCSA_FAST void mcsa_core_isr_end(mcsa_core *c, float isr_duration) {
 	if (c->sampled_this_isr) {
 		c->sampled_this_isr = false;
 		if (isr_duration > c->isr_max_capture) {
 			c->isr_max_capture = isr_duration;
+		}
+		// Protects the motor control: one overlong ISR ends the capture
+		if (c->isr_limit > 0.0f && isr_duration > c->isr_limit) {
+			mcsa_core_stop(c, MCSA_STOP_ISR_OVERLOAD);
 		}
 	} else {
 		if (isr_duration > c->isr_max_idle_win) {

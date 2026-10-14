@@ -923,6 +923,33 @@ static void test_rdiv64_matches_reference(void) {
 	g_checks++;
 }
 
+// ---------------- ISR overload guard ----------------
+
+static void test_isr_overload_stops_capture(void) {
+	mcsa_core c;
+	new_core(&c, BUF_BYTES);
+	sim_t s = sim_default();
+	start_ok(&c, MCSA_MODE_CONTINUOUS, 0x0087, 10, 0);
+	sim_run(&c, &s, 100);
+	CHECK(mcsa_core_running(&c));
+
+	// 90 % of the 33.3 us cycle at 30 kHz is the limit; 29 us is fine
+	c.sampled_this_isr = true;
+	mcsa_core_isr_end(&c, 29.0e-6f);
+	CHECK(mcsa_core_running(&c));
+
+	// One ISR above the limit ends the capture before the next one
+	c.sampled_this_isr = true;
+	mcsa_core_isr_end(&c, 31.0e-6f);
+	CHECK_EQ(c.state, MCSA_STATE_DONE);
+	CHECK_EQ(c.stop_reason, MCSA_STOP_ISR_OVERLOAD);
+	CHECK_NEAR(c.isr_max_capture, 31.0e-6, 1e-9);
+
+	// Long ISRs without a capture never stop anything
+	mcsa_core_isr_end(&c, 40.0e-6f);
+	CHECK_EQ(c.stop_reason, MCSA_STOP_ISR_OVERLOAD);
+}
+
 int main(void) {
 	test_crc16();
 	test_angle_counter();
@@ -945,6 +972,7 @@ int main(void) {
 	test_sample_print_takeover_clears_mcsa_data();
 	test_angle_step_limit();
 	test_rdiv64_matches_reference();
+	test_isr_overload_stops_capture();
 
 	printf("%d Pruefungen, %d Fehler\n", g_checks, g_failed);
 	return g_failed == 0 ? 0 : 1;

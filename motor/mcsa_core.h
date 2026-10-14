@@ -43,6 +43,9 @@
 #define MCSA_R_MAX					64
 #define MCSA_DROP_OUTPUTS			(MCSA_CIC_ORDER - 1)
 
+// A FOC ISR with capture that takes longer than this fraction of its cycle ends the capture
+#define MCSA_ISR_LIMIT				0.9f
+
 // Channels: bit in the mask, order in a record
 #define MCSA_CH_IA					0
 #define MCSA_CH_IB					1
@@ -109,7 +112,8 @@ typedef enum {
 	MCSA_STOP_INDEX_LIMIT,
 	MCSA_STOP_ANGLE_LIMIT,
 	MCSA_STOP_SAMPLE_PRINT,
-	MCSA_STOP_ANGLE_STEP		// 4 or more electrical revolutions between two records
+	MCSA_STOP_ANGLE_STEP,		// 4 or more electrical revolutions between two records
+	MCSA_STOP_ISR_OVERLOAD		// FOC ISR with capture longer than MCSA_ISR_LIMIT of its cycle
 } mcsa_stop_reason;
 
 typedef enum {
@@ -195,6 +199,7 @@ typedef struct {
 	// ISR timing in s
 	bool sampled_this_isr;
 	volatile float isr_max_capture;
+	float isr_limit;				// s, 0 = no limit
 	volatile float isr_max_idle;
 	float isr_max_idle_win;
 	uint32_t isr_idle_cnt;
