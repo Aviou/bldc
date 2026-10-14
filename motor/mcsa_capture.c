@@ -48,11 +48,6 @@ __attribute__((section(".ram4"), aligned(8))) volatile mcsa_shared_buffer mcsa_c
 #define MCSA_FIFO_WORDS		448
 __attribute__((section(".ram4"), aligned(4))) static volatile uint32_t m_fifo[MCSA_FIFO_WORDS];
 
-// Entries per drain call. The batches keep the work per call bounded, and the thread yields
-// between them, so the threads of the same priority (among them the watchdog thread) keep
-// running even if the drain only just keeps up with the ISR.
-#define MCSA_DRAIN_BATCH	32
-
 static THD_WORKING_AREA(drain_thread_wa, 512);
 static THD_FUNCTION(drain_thread, arg);
 
@@ -209,6 +204,9 @@ static THD_FUNCTION(drain_thread, arg) {
 
 	m_drain.min_one = UINT32_MAX;
 
+	// Batches of MCSA_DRAIN_BATCH keep the work per call bounded, and the thread yields between
+	// them, so the threads of the same priority (among them the watchdog thread) keep running
+	// even if the drain only just keeps up with the ISR.
 	for (;;) {
 		uint32_t s0 = DWT->CYCCNT;
 		chThdSleepMicroseconds(500);
