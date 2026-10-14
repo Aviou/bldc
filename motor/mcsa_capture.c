@@ -51,10 +51,12 @@ __attribute__((section(".ram4"), aligned(4))) static volatile uint32_t m_fifo[MC
 static THD_WORKING_AREA(drain_thread_wa, 512);
 
 // Under load the FOC ISR takes about 78 % of the CPU and the other NORMALPRIO threads share
-// the rest; in turn with them the drain fell behind. So every 0.5 ms it first takes up to
-// DRAIN_FIRST entries with priority over them (8 000 entries/s, enough for R >= 4), a short
-// piece of work that delays the others but never starves them. Whatever is still waiting
-// follows at NORMALPRIO in batches with chThdYield, like the other threads.
+// the rest; in turn with them the drain fell behind. So during a capture it first takes up to
+// DRAIN_FIRST entries every 0.5 ms with priority over them (8 000 entries/s, enough for
+// R >= 4), a short piece of work that delays the others but never starves them. Whatever is
+// still waiting follows at NORMALPRIO in batches with chThdYield, like the other threads.
+// Without a capture it runs at NORMALPRIO: woken with priority at the systick, which is locked
+// to the PWM, it made the longest FOC ISR about 2 us longer (measured at standstill).
 #define DRAIN_PRIO			(NORMALPRIO + 1)
 #define DRAIN_FIRST			4
 
@@ -98,7 +100,7 @@ void mcsa_capture_init(void) {
 	chMtxObjectInit(&m_mutex);
 	mcsa_core_init(&mcsa_capture_core, mcsa_capture_shared.mcsa, MCSA_CAPTURE_BUF_BYTES,
 			m_fifo, sizeof(m_fifo));
-	chThdCreateStatic(drain_thread_wa, sizeof(drain_thread_wa), DRAIN_PRIO, drain_thread, NULL);
+	chThdCreateStatic(drain_thread_wa, sizeof(drain_thread_wa), NORMALPRIO, drain_thread, NULL);
 
 	// Cycle counter for mcsa_perf
 	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -221,6 +223,7 @@ static THD_FUNCTION(drain_thread, arg) {
 	for (;;) {
 		// Without a capture rarely: every wake-up costs other threads CPU time
 		bool active = c->state == MCSA_STATE_RUNNING || c->fifo_tail != c->fifo_head;
+		chThdSetPriority(active ? DRAIN_PRIO : NORMALPRIO);
 		uint32_t s0 = DWT->CYCCNT;
 		chThdSleepMicroseconds(active ? 500 : 2000);
 
@@ -243,14 +246,15 @@ static THD_FUNCTION(drain_thread, arg) {
 		last = now;
 
 		uint32_t taken = drain_locked(c, DRAIN_FIRST);
-		m_drain.first += taken;
+		if (active) {
+			m_drain.first += taken;
+		}
 		if (taken == DRAIN_FIRST) {
 			chThdSetPriority(NORMALPRIO);
 			do {
 				taken = drain_locked(c, MCSA_DRAIN_BATCH);
 				chThdYield();
 			} while (taken == MCSA_DRAIN_BATCH);
-			chThdSetPriority(DRAIN_PRIO);
 		}
 	}
 }
