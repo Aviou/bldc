@@ -691,10 +691,13 @@ static int cmd_stop(mcsa_core *c, const mcsa_env *env, const uint8_t *a, uint32_
 }
 
 // Drain for STATUS and READ, which run under the firmware mutex: while the ISR still pushes,
-// one batch keeps the lock short; afterwards everything waiting, so n_written is final.
+// nothing, the drain thread keeps up with priority (under load even one batch here held the
+// lock for tens of ms); afterwards everything waiting, so n_written is final.
 static void drain_for_command(mcsa_core *c) {
 	bool pushing = c->state == MCSA_STATE_RUNNING && !c->isr_halt;
-	mcsa_core_drain(c, pushing ? MCSA_DRAIN_BATCH : UINT32_MAX);
+	if (!pushing) {
+		mcsa_core_drain(c, UINT32_MAX);
+	}
 }
 
 static int cmd_status(mcsa_core *c, const mcsa_env *env, uint8_t *r) {

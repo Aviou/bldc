@@ -1045,7 +1045,7 @@ static void test_drain_is_bounded_per_call(void) {
 	}
 }
 
-static void test_commands_drain_one_batch_while_running(void) {
+static void test_commands_leave_the_drain_to_the_thread_while_running(void) {
 	mcsa_core c;
 	new_core(&c, BUF_BYTES);
 	mcsa_env e = test_env();
@@ -1054,21 +1054,22 @@ static void test_commands_drain_one_batch_while_running(void) {
 	start_ok(&c, MCSA_MODE_CONTINUOUS, 0x0087, 1, 0);
 	sim_run(&c, &s, 80);			// 80 entries waiting, the ISR keeps pushing
 
-	// STATUS and READ run under the firmware mutex: one batch each, so the lock is short
+	// STATUS and READ run under the firmware mutex. Under load even a batch kept it for tens
+	// of ms and blocked the prioritized drain thread, so they leave the FIFO to it.
 	uint8_t rq[64];
 	uint8_t rs[RESP_MAX];
 	uint32_t l = req(rq, MCSA_CMD_STATUS, NULL, 0);
 	process(&c, &e, rq, l, rs);
 	const uint8_t *b = rs + MCSA_RESP_HDR_LEN;
 	CHECK_EQ(b[0], MCSA_STATE_RUNNING);
-	CHECK_EQ(be32(b + 16), MCSA_DRAIN_BATCH - MCSA_DROP_OUTPUTS);
+	CHECK_EQ(be32(b + 16), 0);
 
 	build_read(rq, &l, 1, 0, 0xFFFF);
 	process(&c, &e, rq, l, rs);
 	CHECK_EQ(rs[4], MCSA_OK);
-	CHECK_EQ(c.n_written, 2 * MCSA_DRAIN_BATCH - MCSA_DROP_OUTPUTS);
+	CHECK_EQ(c.n_written, 0);
 
-	// Once the ISR has stopped pushing, everything waiting is taken at once
+	// Once the ISR has stopped pushing, everything waiting is taken at once (n_written is final)
 	mcsa_core_stop(&c, MCSA_STOP_ISR_OVERLOAD);
 	l = req(rq, MCSA_CMD_STATUS, NULL, 0);
 	process(&c, &e, rq, l, rs);
@@ -1118,7 +1119,7 @@ int main(void) {
 	test_isr_halts_after_oneshot_and_status_drains();
 	test_stop_drains_pending_records();
 	test_drain_is_bounded_per_call();
-	test_commands_drain_one_batch_while_running();
+	test_commands_leave_the_drain_to_the_thread_while_running();
 	test_start_tells_which_inputs_are_needed();
 
 	printf("%d Pruefungen, %d Fehler\n", g_checks, g_failed);

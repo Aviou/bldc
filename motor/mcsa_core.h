@@ -224,9 +224,6 @@ typedef struct {
 void mcsa_core_init(mcsa_core *c, volatile int16_t *buf, uint32_t buf_bytes,
 		volatile uint32_t *fifo, uint32_t fifo_bytes);
 void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in);
-// FIFO entries per drain call of the drain thread, and per command while the ISR still pushes
-#define MCSA_DRAIN_BATCH		32
-
 // Takes at most max_entries FIFO entries, and only those waiting at the call: the work per
 // call stays bounded while the ISR keeps pushing. Returns the number of entries taken.
 uint32_t mcsa_core_drain(mcsa_core *c, uint32_t max_entries);

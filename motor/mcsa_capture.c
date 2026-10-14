@@ -51,14 +51,17 @@ __attribute__((section(".ram4"), aligned(4))) static volatile uint32_t m_fifo[MC
 static THD_WORKING_AREA(drain_thread_wa, 512);
 
 // Under load the FOC ISR takes about 78 % of the CPU and the other NORMALPRIO threads share
-// the rest; in turn with them the drain fell behind. So during a capture it first takes up to
+// the rest; in turn with them the drain fell behind. So during a capture it takes up to
 // DRAIN_FIRST entries every 0.5 ms with priority over them (8 000 entries/s, enough for
-// R >= 4), a short piece of work that delays the others but never starves them. Whatever is
-// still waiting follows at NORMALPRIO in batches with chThdYield, like the other threads.
+// R >= 4), a short piece of work that delays the others but never starves them. If more is
+// waiting, one more piece of DRAIN_MORE at NORMALPRIO (with spare CPU at standstill up to
+// 24 000 entries/s in total); it stays small, so the next prioritized wake-up is on time
+// even when that piece gets little CPU under load.
 // Without a capture it runs at NORMALPRIO: woken with priority at the systick, which is locked
 // to the PWM, it made the longest FOC ISR about 2 us longer (measured at standstill).
 #define DRAIN_PRIO			(NORMALPRIO + 1)
 #define DRAIN_FIRST			4
+#define DRAIN_MORE			8
 
 static THD_FUNCTION(drain_thread, arg);
 
@@ -251,10 +254,7 @@ static THD_FUNCTION(drain_thread, arg) {
 		}
 		if (taken == DRAIN_FIRST) {
 			chThdSetPriority(NORMALPRIO);
-			do {
-				taken = drain_locked(c, MCSA_DRAIN_BATCH);
-				chThdYield();
-			} while (taken == MCSA_DRAIN_BATCH);
+			drain_locked(c, DRAIN_MORE);
 		}
 	}
 }
