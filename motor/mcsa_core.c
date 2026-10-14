@@ -25,14 +25,6 @@
 #define ANGLE_UNITS_PER_RAD		(65536.0f / TWO_PI_F)
 #define IDLE_WINDOW				30000
 
-// The drain runs from SRAM: the FOC ISR evicts the flash cache (ART) between two drain
-// calls, and the cold code from flash costs about four times as many cycles.
-#if defined(__arm__)
-#define MCSA_RAMFUNC			__attribute__((section(".ramtext")))
-#else
-#define MCSA_RAMFUNC
-#endif
-
 static inline __attribute__((always_inline)) int32_t round_to_i32(float x) {
 	if (!(x == x)) {
 		return 0;
@@ -68,7 +60,7 @@ static inline __attribute__((always_inline)) uint64_t udiv64_small(uint64_t n, u
 	return q;
 }
 
-MCSA_RAMFUNC int64_t mcsa_rdiv64(int64_t n, uint32_t d) {
+int64_t mcsa_rdiv64(int64_t n, uint32_t d) {
 	if (d == 1) {
 		return n;
 	}
@@ -524,7 +516,7 @@ static void stop_from_drain(mcsa_core *c, mcsa_stop_reason reason) {
 	c->isr_halt = true;
 }
 
-MCSA_RAMFUNC uint32_t mcsa_core_drain(mcsa_core *c, uint32_t max_entries) {
+uint32_t mcsa_core_drain(mcsa_core *c, uint32_t max_entries) {
 	const uint16_t mask = c->mask;
 	const int32_t r3 = (int32_t)c->r3;
 	const uint32_t head = c->fifo_head;		// Entries pushed later wait for the next call
