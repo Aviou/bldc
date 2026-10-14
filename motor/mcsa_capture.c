@@ -31,6 +31,8 @@
 #include "mcpwm_foc.h"
 #include "mempools.h"
 #include "packet.h"
+#include "terminal.h"
+#include "commands.h"
 
 _Static_assert(sizeof(mcsa_sp_layout) == 36000, "COMM_SAMPLE_PRINT layout must be 36000 bytes");
 _Static_assert(sizeof(mcsa_shared_buffer) == MCSA_CAPTURE_BUF_BYTES, "shared buffer size");
@@ -57,9 +59,72 @@ static bool buffer_free(void) {
 	return !mc_interface_sample_print_busy();
 }
 
+typedef struct {
+	uint32_t count;
+	uint32_t max_angle, max_fill, max_sample;
+	uint64_t sum_sample;
+} perf_cat;
+
+static volatile perf_cat m_perf[2];		// [0] without, [1] with an output value
+
+static void terminal_perf(int argc, const char **argv);
+
 void mcsa_capture_init(void) {
 	chMtxObjectInit(&m_mutex);
 	mcsa_core_init(&mcsa_capture_core, mcsa_capture_shared.mcsa, MCSA_CAPTURE_BUF_BYTES);
+
+	// Cycle counter for mcsa_perf
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->CYCCNT = 0;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+	terminal_register_command_callback("mcsa_perf",
+			"Cycles of the MCSA capture hook in the FOC ISR since the last call (and reset).",
+			0, terminal_perf);
+}
+
+void mcsa_capture_perf_add(uint32_t cyc_angle, uint32_t cyc_fill, uint32_t cyc_sample, bool output) {
+	volatile perf_cat *p = &m_perf[output ? 1 : 0];
+	p->count++;
+	p->sum_sample += cyc_sample;
+	if (cyc_angle > p->max_angle) {
+		p->max_angle = cyc_angle;
+	}
+	if (cyc_fill > p->max_fill) {
+		p->max_fill = cyc_fill;
+	}
+	if (cyc_sample > p->max_sample) {
+		p->max_sample = cyc_sample;
+	}
+}
+
+static void terminal_perf(int argc, const char **argv) {
+	(void)argc;
+	(void)argv;
+
+	perf_cat p[2];
+	chSysLock();
+	for (int i = 0; i < 2; i++) {
+		p[i].count = m_perf[i].count;
+		p[i].max_angle = m_perf[i].max_angle;
+		p[i].max_fill = m_perf[i].max_fill;
+		p[i].max_sample = m_perf[i].max_sample;
+		p[i].sum_sample = m_perf[i].sum_sample;
+		memset((void *)&m_perf[i], 0, sizeof(perf_cat));
+	}
+	chSysUnlock();
+
+	const float us = 1.0e6f / (float)STM32_SYSCLK;
+	for (int i = 0; i < 2; i++) {
+		float mean = p[i].count ? (float)p[i].sum_sample / (float)p[i].count : 0.0f;
+		commands_printf("%s: n=%u angle max %u cyc, fill max %u cyc, sample max %u cyc (%.2f us), mean %.0f cyc (%.2f us)",
+				i ? "with output   " : "without output", (unsigned)p[i].count,
+				(unsigned)p[i].max_angle, (unsigned)p[i].max_fill, (unsigned)p[i].max_sample,
+				(double)((float)p[i].max_sample * us), (double)mean, (double)(mean * us));
+	}
+	commands_printf("ISR max with capture %.1f us, without %.1f us\n",
+			(double)(mcsa_capture_core.isr_max_capture * 1.0e6f),
+			(double)(mcsa_capture_core.isr_max_idle * 1.0e6f));
 }
 
 void mcsa_capture_lock(void) {

@@ -84,4 +84,7 @@ bool mcsa_capture_sample_print_request(debug_sampling_mode mode);
 // Configuration written: a running capture ends
 void mcsa_capture_config_changed(void);
 
+// Cycle counts of the ISR hook (DWT), shown by the terminal command mcsa_perf
+void mcsa_capture_perf_add(uint32_t cyc_angle, uint32_t cyc_fill, uint32_t cyc_sample, bool output);
+
 #endif /* MCSA_CAPTURE_H_ */
