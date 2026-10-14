@@ -250,6 +250,9 @@ class McsaClient:
         self.last_uptime = None
         self.reboots = 0
         self._guard_reboots = None
+        # Wird bei jedem Abbruch von capture()/stream() als Erstes aufgerufen, vor dem
+        # Aufräum-STOP; ein Lauftest gibt hier z. B. den Motor frei.
+        self.abort_hook = None
 
     def _note_uptime(self, uptime):
         last = self.last_uptime
@@ -402,6 +405,7 @@ class McsaClient:
                     raise ProtocolError('READ lieferte vor dem Ende keine Daten')
             return info, s, rec
         except (Exception, KeyboardInterrupt) as e:
+            self._run_abort_hook()
             raise CaptureAborted(f'Einzelaufnahme abgebrochen: {e}', info, rec) from e
         finally:
             self._guard_reboots = None
@@ -431,6 +435,7 @@ class McsaClient:
             return info, s, rec
         except (Exception, KeyboardInterrupt) as e:
             self._guard_reboots = None
+            self._run_abort_hook()
             if session is not None and final is None:
                 try:
                     self.stop(session)
@@ -439,6 +444,13 @@ class McsaClient:
             raise CaptureAborted(f'Daueraufnahme abgebrochen: {e}', info, rec) from e
         finally:
             self._guard_reboots = None
+
+    def _run_abort_hook(self):
+        if self.abort_hook is not None:
+            try:
+                self.abort_hook()
+            except Exception:
+                pass
 
     def offset_check(self, decimation=10, length=1000, threshold=1.5, wait=time.sleep):
         """Rest-Offset der drei Shunts im Stillstand, in ADC-Stufen."""

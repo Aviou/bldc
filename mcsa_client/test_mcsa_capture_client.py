@@ -76,9 +76,11 @@ class LibTransport:
         self.fail_reads_after = None
         self.requests = 0
         self.queue = []
+        self.log = []               # Befehle in Sendereihenfolge
 
     def request(self, app_payload, cmd):
         self.requests += 1
+        self.log.append(cmd)
         if cmd == mc.CMD_READ and self.fail_reads_after is not None and self.requests > self.fail_reads_after:
             raise TimeoutError('simulierter Verbindungsabbruch')
         d = mc.Deframer()
@@ -398,3 +400,26 @@ def test_serial_transport_flushes_stale_input_and_keeps_later_packets():
     assert mc.parse_header(later)[0]['session'] == 3
     with pytest.raises(TimeoutError):
         t.receive(mc.CMD_STATUS)
+
+
+def test_abort_hook_runs_before_cleanup_stop(rig):
+    """Der Aufrufer (z. B. ein Lauftest) muss vor dem Aufräum-STOP reagieren können."""
+    client, t, sim = rig(feed_per_request=100)
+    client.abort_hook = lambda: t.log.append('HOOK')
+    t.fail_reads_after = 8
+    ticks = iter(range(10 ** 6))
+    with pytest.raises(mc.CaptureAborted):
+        client.stream(mask=0x0001, decimation=1, seconds=1000, clock=lambda: next(ticks), wait=NOWAIT)
+    assert t.log.count('HOOK') == 1
+    assert mc.CMD_STOP in t.log[t.log.index('HOOK'):], t.log
+    assert mc.CMD_STOP not in t.log[:t.log.index('HOOK')]
+
+
+def test_abort_hook_runs_on_capture_failure(rig):
+    client, t, sim = rig(feed_per_request=2000)
+    called = []
+    client.abort_hook = lambda: called.append(1)
+    t.fail_reads_after = 4
+    with pytest.raises(mc.CaptureAborted):
+        client.capture(mask=0x0001, decimation=1, length=1000, wait=NOWAIT)
+    assert called == [1]
