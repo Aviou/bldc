@@ -390,72 +390,57 @@ bool mcsa_core_sample_print_request(mcsa_core *c, mcsa_sp_request req) {
 // Kept minimal: integrators, and every R cycles one FIFO entry with the last integrator
 // stage of each channel. Combs, normalization and records run in mcsa_core_drain().
 
-MCSA_RAMFUNC void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
-	if (c->state != MCSA_STATE_RUNNING || c->isr_halt) {
-		return;
-	}
-
-	c->sampled_this_isr = true;
-
-	if (c->need_init) {
-		for (int k = 0; k < 3; k++) {
-			int32_t q3 = round_to_i32(in->offset[k] * 8.0f);
-			int32_t oi = q3 >= 0 ? q3 / 8 : -((-q3 + 7) / 8);
-			c->off_frozen[k] = in->offset[k];
-			c->off_int[k] = oi;
-			c->off_frac_q3[k] = q3 - 8 * oi;
-		}
-		c->theta_start = c->theta;
-		c->need_init = false;
-	}
-
-	const uint16_t mask = c->mask;
-
-	// ADC counts are integer-valued floats: plain conversion, no checks needed
+// Rare parts of the ISR path, out of line: the hot path below stays short, which matters
+// for the cycles and for the 1 KB flash cache that the FOC code also needs.
+static void __attribute__((noinline)) sample_init(mcsa_core *c, const mcsa_sample_in *in) {
 	for (int k = 0; k < 3; k++) {
-		if (mask & (1u << k)) {
-			cic32_push(c->cic32_int[k], (uint32_t)((int32_t)in->adc[k] - c->off_int[k]));
-		}
+		int32_t q3 = round_to_i32(in->offset[k] * 8.0f);
+		int32_t oi = q3 >= 0 ? q3 / 8 : -((-q3 + 7) / 8);
+		c->off_frozen[k] = in->offset[k];
+		c->off_int[k] = oi;
+		c->off_frac_q3[k] = q3 - 8 * oi;
 	}
-	if (c->use_dq) {
-		if (mask & (1u << MCSA_CH_ID)) {
-			cic64_push(c->cic64_int[0], (uint64_t)(int64_t)round_to_i32(in->id * c->q3_per_amp));
-		}
-		if (mask & (1u << MCSA_CH_IQ)) {
-			cic64_push(c->cic64_int[1], (uint64_t)(int64_t)round_to_i32(in->iq * c->q3_per_amp));
-		}
-		if (mask & (1u << MCSA_CH_VD)) {
-			cic64_push(c->cic64_int[2], (uint64_t)(int64_t)round_to_i32(in->vd * 1000.0f));
-		}
-		if (mask & (1u << MCSA_CH_VQ)) {
-			cic64_push(c->cic64_int[3], (uint64_t)(int64_t)round_to_i32(in->vq * 1000.0f));
-		}
-	}
-	if (mask & (1u << MCSA_CH_ANGLE)) {
-		cic64_push(c->cic64_int[4], (uint64_t)(c->theta - c->theta_start));
-	}
+	c->theta_start = c->theta;
+	c->need_init = false;
+}
 
-	if (c->use_flags) {
-		// Flags of this cycle, combined over the current decimation window
-		uint16_t fl = 0;
-		for (int k = 0; k < 3; k++) {
-			if (in->arr > MCSA_HIGH_MOD_MARGIN && in->ccr[k] > in->arr - MCSA_HIGH_MOD_MARGIN) {
-				fl |= (uint16_t)(1u << k);
-			}
-		}
-		if (c->in_count == 0) {
-			c->isr_flags = (uint16_t)(fl | MCSA_FLAG_RUNNING);
-		} else {
-			c->isr_flags |= fl;
-		}
-		if (!in->running) {
-			c->isr_flags &= (uint16_t)~MCSA_FLAG_RUNNING;
-		}
+static void __attribute__((noinline)) sample_dq(mcsa_core *c, const mcsa_sample_in *in) {
+	const uint16_t mask = c->mask;
+	if (mask & (1u << MCSA_CH_ID)) {
+		cic64_push(c->cic64_int[0], (uint64_t)(int64_t)round_to_i32(in->id * c->q3_per_amp));
 	}
+	if (mask & (1u << MCSA_CH_IQ)) {
+		cic64_push(c->cic64_int[1], (uint64_t)(int64_t)round_to_i32(in->iq * c->q3_per_amp));
+	}
+	if (mask & (1u << MCSA_CH_VD)) {
+		cic64_push(c->cic64_int[2], (uint64_t)(int64_t)round_to_i32(in->vd * 1000.0f));
+	}
+	if (mask & (1u << MCSA_CH_VQ)) {
+		cic64_push(c->cic64_int[3], (uint64_t)(int64_t)round_to_i32(in->vq * 1000.0f));
+	}
+}
 
-	if (++c->in_count < c->R) {
-		return;
+// Flags of this cycle, combined over the current decimation window
+static void __attribute__((noinline)) sample_flags(mcsa_core *c, const mcsa_sample_in *in) {
+	uint16_t fl = 0;
+	for (int k = 0; k < 3; k++) {
+		if (in->arr > MCSA_HIGH_MOD_MARGIN && in->ccr[k] > in->arr - MCSA_HIGH_MOD_MARGIN) {
+			fl |= (uint16_t)(1u << k);
+		}
 	}
+	if (c->in_count == 0) {
+		c->isr_flags = (uint16_t)(fl | MCSA_FLAG_RUNNING);
+	} else {
+		c->isr_flags |= fl;
+	}
+	if (!in->running) {
+		c->isr_flags &= (uint16_t)~MCSA_FLAG_RUNNING;
+	}
+}
+
+// End of a decimation window: offset check, last integrator stages into the FIFO
+static void __attribute__((noinline)) sample_push(mcsa_core *c, const mcsa_sample_in *in) {
+	const uint16_t mask = c->mask;
 	c->in_count = 0;
 
 	for (int k = 0; k < 3; k++) {
@@ -495,6 +480,44 @@ MCSA_RAMFUNC void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 
 	if (++c->pushed >= c->push_limit) {
 		c->isr_halt = true;
+	}
+}
+
+// Hot path, every FOC cycle during a capture: only the integrators of the selected channels
+MCSA_RAMFUNC void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
+	if (!mcsa_core_wants_sample(c)) {
+		return;
+	}
+
+	c->sampled_this_isr = true;
+	if (c->need_init) {
+		sample_init(c, in);
+	}
+
+	// ADC counts are integer-valued floats: plain conversion, no checks needed
+	const uint16_t mask = c->mask;
+	const float *adc = in->adc;
+	if (mask & (1u << MCSA_CH_IA)) {
+		cic32_push(c->cic32_int[0], (uint32_t)((int32_t)adc[0] - c->off_int[0]));
+	}
+	if (mask & (1u << MCSA_CH_IB)) {
+		cic32_push(c->cic32_int[1], (uint32_t)((int32_t)adc[1] - c->off_int[1]));
+	}
+	if (mask & (1u << MCSA_CH_IC)) {
+		cic32_push(c->cic32_int[2], (uint32_t)((int32_t)adc[2] - c->off_int[2]));
+	}
+	if (c->use_dq) {
+		sample_dq(c, in);
+	}
+	if (mask & (1u << MCSA_CH_ANGLE)) {
+		cic64_push(c->cic64_int[4], (uint64_t)(c->theta - c->theta_start));
+	}
+	if (c->use_flags) {
+		sample_flags(c, in);
+	}
+
+	if (++c->in_count >= c->R) {
+		sample_push(c, in);
 	}
 }
 

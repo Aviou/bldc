@@ -67,9 +67,8 @@ static bool buffer_free(void) {
 }
 
 typedef struct {
-	uint32_t count;
-	uint32_t max_angle, max_fill, max_sample;
-	uint64_t sum_sample;
+	uint32_t count, max;
+	uint64_t sum;
 } perf_cat;
 
 static volatile perf_cat m_perf[2];		// [0] without, [1] with an output value
@@ -106,19 +105,12 @@ void mcsa_capture_init(void) {
 			0, terminal_perf);
 }
 
-__attribute__((section(".ramtext"))) void mcsa_capture_perf_add(uint32_t cyc_angle, uint32_t cyc_fill,
-		uint32_t cyc_sample, bool output) {
+__attribute__((section(".ramtext"))) void mcsa_capture_perf_add(uint32_t cyc, bool output) {
 	volatile perf_cat *p = &m_perf[output ? 1 : 0];
 	p->count++;
-	p->sum_sample += cyc_sample;
-	if (cyc_angle > p->max_angle) {
-		p->max_angle = cyc_angle;
-	}
-	if (cyc_fill > p->max_fill) {
-		p->max_fill = cyc_fill;
-	}
-	if (cyc_sample > p->max_sample) {
-		p->max_sample = cyc_sample;
+	p->sum += cyc;
+	if (cyc > p->max) {
+		p->max = cyc;
 	}
 }
 
@@ -130,22 +122,20 @@ static void terminal_perf(int argc, const char **argv) {
 	chSysLock();
 	for (int i = 0; i < 2; i++) {
 		p[i].count = m_perf[i].count;
-		p[i].max_angle = m_perf[i].max_angle;
-		p[i].max_fill = m_perf[i].max_fill;
-		p[i].max_sample = m_perf[i].max_sample;
-		p[i].sum_sample = m_perf[i].sum_sample;
+		p[i].max = m_perf[i].max;
+		p[i].sum = m_perf[i].sum;
 		memset((void *)&m_perf[i], 0, sizeof(perf_cat));
 	}
 	chSysUnlock();
 
 	const float us = 1.0e6f / (float)STM32_SYSCLK;
 	for (int i = 0; i < 2; i++) {
-		float mean = p[i].count ? (float)p[i].sum_sample / (float)p[i].count : 0.0f;
-		commands_printf("%s: n=%u angle max %u cyc, fill max %u cyc, sample max %u cyc (%.2f us), mean %.0f cyc (%.2f us)",
+		float mean = p[i].count ? (float)p[i].sum / (float)p[i].count : 0.0f;
+		commands_printf("hook %s: n=%u max %u cyc (%.2f us), mean %.0f cyc (%.2f us)",
 				i ? "with output   " : "without output", (unsigned)p[i].count,
-				(unsigned)p[i].max_angle, (unsigned)p[i].max_fill, (unsigned)p[i].max_sample,
-				(double)((float)p[i].max_sample * us), (double)mean, (double)(mean * us));
+				(unsigned)p[i].max, (double)((float)p[i].max * us), (double)mean, (double)(mean * us));
 	}
+
 	drain_perf d;
 	chSysLock();
 	d.wakes = m_drain.wakes;
