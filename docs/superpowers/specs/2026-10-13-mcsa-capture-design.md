@@ -262,6 +262,13 @@ Transport: `COMM_CUSTOM_APP_DATA` (= 36), über USB direkt oder per `COMM_FORWAR
 - Abschätzung für die Standardmaske: unter 1 µs im Mittel, unter 2 µs bei Ausgabewerten. Budget je Durchlauf bei 30 kHz: 33 µs. Nachweis nur über die Messung am Gerät (`STATUS`), mit Standardmaske und voller Maske.
 - Kein Gleitkomma-`lrintf` in der ISR (Wandlung per Typumwandlung mit eigener Rundung), keine Allokation, keine blockierenden Aufrufe, keine Interruptsperre in der ISR.
 
+**Nachtrag 14.10.2026 (nach Messungen an der Bridge):** Die Abschätzung oben war zu optimistisch. Mit allen Kanälen bei R = 1 lief die ISR in den Watchdog. Umgesetzt ist deshalb eine Aufteilung:
+- **ISR:** rechnet nur die Integratoren. Alle R Durchläufe legt sie die letzte Integratorstufe in einen FIFO (1 792 Byte im CCM).
+- **Abhol-Thread** (`NORMALPRIO`, alle 0,5 ms, Stapel zu 32 mit `chThdYield`): rechnet Kämme, Normierung und Datensätze. `STATUS`, `READ` und `STOP` holen vorher ebenfalls ab.
+- **Schutz:** Neue Stoppgründe `ISR_OVERLOAD` (ein Durchlauf mit Aufnahme über 90 % des Zyklus) und `FIFO_OVERRUN` (Abholen kommt nicht hinterher).
+- **Priorität:** Der Thread lief zuerst mit `NORMALPRIO + 1` und leerte den FIFO „bis leer“. Bei R = 1 verhungerte so der Watchdog-Thread. Deshalb begrenzte Stapel und `NORMALPRIO`.
+- **Messwerte und tragfähige R je Maske:** `mcsa_capture_protocol.md`, Abschnitt Echtzeit.
+
 ## 9. Host-Client `mcsa_client/mcsa_capture_client.py`
 
 - Abhängigkeiten: `pyserial`, `numpy`. Framing und CRC wie `scripts/mcsa/vesc_sampleprint.py` (motorpi).
@@ -311,3 +318,4 @@ Reihenfolge und Prüfschritte stehen in `docs/mcsa_capture_flashing.md`. Kurz:
 - 2026-10-13, Codex (Design-Review): CIC-Überläufe modular definiert; Sample-Print-Sendethread und `SEND_LAST_SAMPLES` abgesichert; gemeinsamer Mutex auch für `READ`; Winkelanker je `READ`; Abbruch bei Offset-/Konfigurationsänderung; idempotenter `START`, Sitzung und Laufzeit in jeder Antwort; ISR-Dauer am ISR-Ende gemessen; Flag-Kanal für Rohkanal-Gültigkeit; FIR-Hinweis korrigiert; Indexgrenze; typisierte Union statt Zeiger.
 - 2026-10-13, Umsetzung: Client liegt in `mcsa_client/` statt `tools/`, weil `tools/` im bldc-Repo der (ignorierte) Toolchain-Ordner von `make arm_sdk_install` ist.
 - 2026-10-13, Abschluss-Review (Claude Opus + Codex): Sample-Print-Übernahme löscht MCSA-Daten; Stoppgrund `ANGLE_STEP`; Konfigurationshook auch am Ende; Client verwirft veraltete `READ`-Antworten, bricht bei Reboot ab (Tick-Überlauf ausgenommen), stoppt bei Abbruch, erkennt Token-Kollisionen, schreibt den Winkel exakt; `offsetof`-Asserts.
+- 2026-10-14, Messungen an der Bridge: ISR/Thread-Aufteilung mit FIFO, Stoppgründe `ISR_OVERLOAD` und `FIFO_OVERRUN`, Terminalbefehl `mcsa_perf`; Nachtrag in Abschnitt 8.

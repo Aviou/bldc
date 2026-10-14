@@ -156,6 +156,8 @@ Bei `NOT_AVAILABLE` und `OVERWRITTEN` enthält der Körper den ältesten verfüg
 | 6 | `BAD_VERSION` | | | 6 | `ANGLE_LIMIT` |
 | 7 | `NOT_FOC` | | | 7 | `SAMPLE_PRINT` |
 | | | | | 8 | `ANGLE_STEP` (4 oder mehr el. Umdrehungen zwischen zwei Datensätzen) |
+| | | | | 9 | `ISR_OVERLOAD` (ein FOC-Durchlauf mit Aufnahme über 90 % seines Zyklus) |
+| | | | | 10 | `FIFO_OVERRUN` (das Abholen kam nicht hinterher, siehe Echtzeit) |
 
 ## Kanäle
 
@@ -234,7 +236,7 @@ theta_q13 = anchor + np.concatenate(([0], np.cumsum(d)))   # 1/8192 el. Umdrehun
 - Bricht eine Daueraufnahme ab, sendet der Client noch `STOP`. Eine verwaiste Aufnahme beendet `mcsa_capture_client.py PORT [--can ID] stop`.
 
 Durchsatz:
-- **USB:** reicht für die Daueraufnahme mit R = 10 bei voller Standardmaske.
+- **USB:** etwa 80 `READ` je Sekunde. Mit 8-Byte-Datensätzen (Standardmaske) sind das rund 4 700 Datensätze/s: Die Daueraufnahme ist ab R = 10 lückenlos, bei R = 5 entstehen Lücken. Mit nur einem Kanal (2 Byte) bleibt sie bis R = 2 lückenlos. Grenzen der Firmware selbst: Abschnitt Echtzeit.
 - **CAN mit 500 kbit/s:** Die Statusmeldungen der Controller belegen schon etwa ein Viertel des Busses. Für eine Daueraufnahme über CAN mit 4 Kanälen deshalb R ≥ 20 wählen und immer nur einen Knoten zur Zeit aufnehmen lassen. Eine Einzelaufnahme mit beliebigem R ist über CAN in etwa 2–3 s abgeholt (40 KB Puffer, rund 85 Anfragen).
 
 ## Zusammenspiel mit `COMM_SAMPLE_PRINT`
@@ -251,7 +253,27 @@ Eine Konfigurationsänderung (`mc_interface_set_configuration`, zum Beispiel dur
 
 ## Echtzeit
 
-- **Umdrehungszähler:** kostet in jedem FOC-Durchlauf etwa 40 Befehle, auch ohne Aufnahme.
-- **Mit Standardmaske:** Ein Durchlauf ohne Ausgabewert kostet geschätzt unter 1 µs. Ein Durchlauf mit Ausgabewert kostet geschätzt etwa 2–3 µs, weil die Winkelnormierung eine 64-Bit-Division braucht.
-- **Budget:** 33 µs je Durchlauf bei 30 kHz.
-- **Messung:** `STATUS` meldet die tatsächlichen Maxima mit und ohne Aufnahme. Am Gerät mit Standardmaske und mit Maske 0x01FF messen.
+**Aufteilung:**
+- **FOC-Interrupt:** führt in jedem Durchlauf den Umdrehungszähler (etwa 90 Zyklen, auch ohne Aufnahme). Während einer Aufnahme rechnet er nur die Integratoren des CIC-Filters. Alle R Durchläufe legt er deren letzte Stufe in einen FIFO (1 792 Byte im CCM; je nach Maske 32 bis 448 Einträge).
+- **Abhol-Thread** (`MCSA drain`, gleiche Priorität wie der Watchdog-Thread): wacht alle 0,5 ms auf und rechnet Kämme, Normierung und Datensätze. Er arbeitet in Stapeln zu 32 Einträgen und gibt dazwischen die CPU ab. `STATUS`, `READ` und `STOP` holen vorher ebenfalls ab.
+
+**Schutz:**
+- **`ISR_OVERLOAD`:** Ein FOC-Durchlauf mit Aufnahme über 90 % seines Zyklus (30 µs bei 30 kHz) beendet die Aufnahme.
+- **`FIFO_OVERRUN`:** Kommt das Abholen nicht hinterher, endet die Aufnahme. Die Datensätze bis dahin bleiben lesbar. Zu viel Last führt so nie zu einem Watchdog-Neustart.
+
+**Gemessen an der Bridge im Stillstand** (FW `9dd573db`, 14.10.2026):
+
+| | Standardmaske 0x0087 | alle Kanäle 0x01FF | ein Kanal 0x0001 |
+|---|---|---|---|
+| Interrupt-Anteil je Durchlauf ohne / mit Ausgabewert | 1,65 / 2,6 µs | 4,5 / 5,6 µs | – / 2,0 µs (R = 1) |
+| FOC-Durchlauf max. ohne / mit Aufnahme | 17,4 / 20,9 µs | 17,4 / 23,9 µs | 17,4 / 20,4–21,3 µs |
+| Abholen je Eintrag, rein (Interrupts gesperrt) | ≈ 1 140 Zyklen | ≈ 2 500 Zyklen | – |
+| Abholen je Eintrag im Betrieb, ohne FOC-Interrupt | ≈ 1 900–2 800 Zyklen | ≈ 8 000–11 000 Zyklen | ≈ 1 100–1 500 Zyklen |
+| Einzelaufnahme vollständig ab | R = 2 | R = 10 | R = 1 |
+| Daueraufnahme über USB lückenlos ab | R = 10 | R = 20 | R = 2 |
+
+Darunter endet die Aufnahme mit `FIFO_OVERRUN` (bzw. bei der Daueraufnahme mit Standardmaske und R = 5 mit Lücken durch USB). Der FOC-Interrupt belegt im Stillstand 56 % der CPU, mit Aufnahme 59–62 %. Unter Last steigt er, die Grenzen verschieben sich dann zu größerem R.
+
+**Messen:**
+- `STATUS` meldet die ISR-Maxima mit und ohne Aufnahme.
+- Der Terminalbefehl `mcsa_perf` (VESC Tool oder `term_cmd.py PORT -1 mcsa_perf` aus motorpi `scripts/mcsa`) zeigt seit dem letzten Aufruf: Zyklen des Interrupt-Anteils, Kosten und Pausen des Abhol-Threads, höchsten FIFO-Füllstand und die Last des FOC-Interrupts (bei Abständen unter 20 s). Danach setzt er die Werte zurück.
