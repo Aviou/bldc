@@ -85,6 +85,7 @@ typedef struct {
 	uint32_t wakes, entries;
 	uint64_t cyc;
 	uint32_t max_gap, max_fill;
+	uint32_t max_sleep, max_lock, max_call, min_one;
 } drain_perf;
 
 static volatile drain_perf m_drain;
@@ -154,7 +155,12 @@ static void terminal_perf(int argc, const char **argv) {
 	d.cyc = m_drain.cyc;
 	d.max_gap = m_drain.max_gap;
 	d.max_fill = m_drain.max_fill;
+	d.max_sleep = m_drain.max_sleep;
+	d.max_lock = m_drain.max_lock;
+	d.max_call = m_drain.max_call;
+	d.min_one = m_drain.min_one;
 	memset((void *)&m_drain, 0, sizeof(m_drain));
+	m_drain.min_one = UINT32_MAX;
 	chSysUnlock();
 	commands_printf("drain thread: %u wake-ups, %u entries, %.0f cyc per entry without FOC ISR, "
 			"max gap %.0f us, max fill %u of %u entries",
@@ -162,6 +168,10 @@ static void terminal_perf(int argc, const char **argv) {
 			(double)(d.entries ? (float)d.cyc / (float)d.entries : 0.0f),
 			(double)((float)d.max_gap * us), (unsigned)d.max_fill,
 			(unsigned)mcsa_capture_core.fifo_slots);
+	commands_printf("drain thread: max sleep %.0f us, max lock wait %.0f us, max call %.0f us, "
+			"single entry min %u cyc",
+			(double)((float)d.max_sleep * us), (double)((float)d.max_lock * us),
+			(double)((float)d.max_call * us), (unsigned)(d.min_one == UINT32_MAX ? 0 : d.min_one));
 	commands_printf("ISR max with capture %.1f us, without %.1f us\n",
 			(double)(mcsa_capture_core.isr_max_capture * 1.0e6f),
 			(double)(mcsa_capture_core.isr_max_idle * 1.0e6f));
@@ -182,10 +192,16 @@ static THD_FUNCTION(drain_thread, arg) {
 	mcsa_core *c = &mcsa_capture_core;
 	uint32_t last = DWT->CYCCNT;
 
+	m_drain.min_one = UINT32_MAX;
+
 	for (;;) {
+		uint32_t s0 = DWT->CYCCNT;
 		chThdSleepMicroseconds(500);
 
 		uint32_t now = DWT->CYCCNT;
+		if (now - s0 > m_drain.max_sleep) {
+			m_drain.max_sleep = now - s0;
+		}
 		uint32_t head = c->fifo_head;
 		uint32_t tail = c->fifo_tail;
 		uint32_t fill = head >= tail ? head - tail : head + c->fifo_slots - tail;
@@ -202,6 +218,7 @@ static THD_FUNCTION(drain_thread, arg) {
 
 		uint32_t taken;
 		do {
+			uint32_t l0 = DWT->CYCCNT;
 			mcsa_capture_lock();
 			uint32_t c0 = DWT->CYCCNT;
 			uint32_t i0 = mcsa_capture_isr_cyc;
@@ -209,9 +226,18 @@ static THD_FUNCTION(drain_thread, arg) {
 			uint32_t wall = DWT->CYCCNT - c0;
 			uint32_t isr = mcsa_capture_isr_cyc - i0;
 			mcsa_capture_unlock();
+			if (c0 - l0 > m_drain.max_lock) {
+				m_drain.max_lock = c0 - l0;
+			}
 			if (taken > 0) {
 				m_drain.entries += taken;
 				m_drain.cyc += wall > isr ? wall - isr : 0;
+				if (wall > m_drain.max_call) {
+					m_drain.max_call = wall;
+				}
+				if (taken == 1 && wall < m_drain.min_one) {
+					m_drain.min_one = wall;
+				}
 			}
 			chThdYield();
 		} while (taken == MCSA_DRAIN_BATCH);
