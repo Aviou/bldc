@@ -215,6 +215,10 @@ int mcsa_core_process(mcsa_core *c, const mcsa_env *env, const uint8_t *req, uin
 		uint8_t *resp, uint32_t resp_max);
 uint16_t mcsa_crc16(const uint8_t *buf, uint32_t len);
 
+// n / d rounded half away from zero, 1 <= d <= 2^18. Uses 32-bit hardware divisions
+// only, because __aeabi_ldivmod is far too slow for the FOC ISR.
+int64_t mcsa_rdiv64(int64_t n, uint32_t d);
+
 static inline bool mcsa_core_running(const mcsa_core *c) {
 	return c->state == MCSA_STATE_RUNNING;
 }

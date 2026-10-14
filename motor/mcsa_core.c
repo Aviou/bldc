@@ -25,7 +25,7 @@
 #define ANGLE_UNITS_PER_RAD		(65536.0f / TWO_PI_F)
 #define IDLE_WINDOW				30000
 
-static int32_t round_to_i32(float x) {
+static inline __attribute__((always_inline)) int32_t round_to_i32(float x) {
 	if (!(x == x)) {
 		return 0;
 	}
@@ -43,8 +43,31 @@ static int32_t rdiv32(int32_t n, int32_t d) {
 	return n >= 0 ? (n + d / 2) / d : -((-n + d / 2) / d);
 }
 
-static int64_t rdiv64(int64_t n, int64_t d) {
-	return n >= 0 ? (n + d / 2) / d : -((-n + d / 2) / d);
+// 64 by 32 bit division for d <= 2^18 in 14-bit steps: the partial remainder stays
+// below 2^18, so every step fits a 32-bit hardware division.
+static uint64_t udiv64_small(uint64_t n, uint32_t d) {
+	uint32_t r = (uint32_t)(n >> 56);
+	uint64_t q = r / d;
+	r -= (uint32_t)q * d;
+
+	for (int shift = 42; shift >= 0; shift -= 14) {
+		uint32_t cur = (r << 14) | ((uint32_t)(n >> shift) & 0x3FFFu);
+		uint32_t qd = cur / d;
+		r = cur - qd * d;
+		q = (q << 14) | qd;
+	}
+
+	return q;
+}
+
+int64_t mcsa_rdiv64(int64_t n, uint32_t d) {
+	if (d == 1) {
+		return n;
+	}
+
+	uint64_t m = n >= 0 ? (uint64_t)n : (uint64_t)0 - (uint64_t)n;
+	uint64_t q = udiv64_small(m + d / 2, d);
+	return n >= 0 ? (int64_t)q : -(int64_t)q;
 }
 
 static int64_t floor_div8(int64_t v) {
@@ -453,8 +476,7 @@ void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 		return;
 	}
 
-	int16_t val[MCSA_CH_NUM];
-	memset(val, 0, sizeof(val));
+	int16_t val[MCSA_CH_NUM];		// Only the channels in the mask are set and read
 	const int32_t r3 = (int32_t)c->r3;
 
 	for (int k = 0; k < 3; k++) {
@@ -466,11 +488,11 @@ void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 	}
 	for (int j = 0; j < 4; j++) {
 		if (mask & (1u << (MCSA_CH_ID + j))) {
-			val[MCSA_CH_ID + j] = sat16(c, rdiv64(y64[j], r3));
+			val[MCSA_CH_ID + j] = sat16(c, mcsa_rdiv64(y64[j], c->r3));
 		}
 	}
 	if (mask & (1u << MCSA_CH_ANGLE)) {
-		int64_t rel = rdiv64(y64[4], r3);
+		int64_t rel = mcsa_rdiv64(y64[4], c->r3);
 		if (rel >= MCSA_ANGLE_LIMIT || rel <= -MCSA_ANGLE_LIMIT) {
 			c->stop_reason = MCSA_STOP_ANGLE_LIMIT;
 			c->state = MCSA_STATE_DONE;

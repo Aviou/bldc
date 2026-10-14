@@ -892,6 +892,37 @@ static void test_angle_step_limit(void) {
 	}
 }
 
+// ---------------- ISR cost: division without __aeabi_ldivmod ----------------
+
+static int64_t ref_rdiv64(int64_t n, int64_t d) {
+	return n >= 0 ? (n + d / 2) / d : -((-n + d / 2) / d);
+}
+
+static void test_rdiv64_matches_reference(void) {
+	const uint32_t ds[6] = {1, 8, 1000, 3375, 250047, 262144};
+	const int64_t ns[12] = {0, 1, -1, 7, -7, 131072, -131072, 8589934591LL, -8589934591LL,
+			(((int64_t)1) << 62) - 1, -((((int64_t)1) << 62) - 1), 4611686018427387904LL / 3};
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 12; j++) {
+			CHECK_EQ(mcsa_rdiv64(ns[j], ds[i]), ref_rdiv64(ns[j], ds[i]));
+		}
+	}
+	// Pseudo-random values across the full range used by the filter
+	uint64_t x = 0x9E3779B97F4A7C15ull;
+	for (int k = 0; k < 20000; k++) {
+		x ^= x << 13;
+		x ^= x >> 7;
+		x ^= x << 17;
+		int64_t n = (int64_t)(x >> 1) - (int64_t)(((uint64_t)1) << 62);
+		uint32_t d = (uint32_t)(x % 262144u) + 1u;
+		if (mcsa_rdiv64(n, d) != ref_rdiv64(n, d)) {
+			CHECK_EQ(mcsa_rdiv64(n, d), ref_rdiv64(n, d));
+			break;
+		}
+	}
+	g_checks++;
+}
+
 int main(void) {
 	test_crc16();
 	test_angle_counter();
@@ -913,6 +944,7 @@ int main(void) {
 	test_protocol_read();
 	test_sample_print_takeover_clears_mcsa_data();
 	test_angle_step_limit();
+	test_rdiv64_matches_reference();
 
 	printf("%d Pruefungen, %d Fehler\n", g_checks, g_failed);
 	return g_failed == 0 ? 0 : 1;
