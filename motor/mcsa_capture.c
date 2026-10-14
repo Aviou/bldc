@@ -66,12 +66,7 @@ static bool buffer_free(void) {
 	return !mc_interface_sample_print_busy();
 }
 
-typedef struct {
-	uint32_t count, max;
-	uint64_t sum;
-} perf_cat;
-
-static volatile perf_cat m_perf[2];		// [0] without, [1] with an output value
+volatile mcsa_capture_perf_cat mcsa_capture_perf[2];
 
 // Drain thread: cycles per entry without FOC ISR time, longest time between two wake-ups,
 // highest FIFO fill at a wake-up
@@ -105,26 +100,17 @@ void mcsa_capture_init(void) {
 			0, terminal_perf);
 }
 
-__attribute__((section(".ramtext"))) void mcsa_capture_perf_add(uint32_t cyc, bool output) {
-	volatile perf_cat *p = &m_perf[output ? 1 : 0];
-	p->count++;
-	p->sum += cyc;
-	if (cyc > p->max) {
-		p->max = cyc;
-	}
-}
-
 static void terminal_perf(int argc, const char **argv) {
 	(void)argc;
 	(void)argv;
 
-	perf_cat p[2];
+	mcsa_capture_perf_cat p[2];
 	chSysLock();
 	for (int i = 0; i < 2; i++) {
-		p[i].count = m_perf[i].count;
-		p[i].max = m_perf[i].max;
-		p[i].sum = m_perf[i].sum;
-		memset((void *)&m_perf[i], 0, sizeof(perf_cat));
+		p[i].count = mcsa_capture_perf[i].count;
+		p[i].max = mcsa_capture_perf[i].max;
+		p[i].sum = mcsa_capture_perf[i].sum;
+		memset((void *)&mcsa_capture_perf[i], 0, sizeof(mcsa_capture_perf_cat));
 	}
 	chSysUnlock();
 

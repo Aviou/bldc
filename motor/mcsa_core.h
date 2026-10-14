@@ -223,7 +223,6 @@ typedef struct {
 
 void mcsa_core_init(mcsa_core *c, volatile int16_t *buf, uint32_t buf_bytes,
 		volatile uint32_t *fifo, uint32_t fifo_bytes);
-void mcsa_core_update_angle(mcsa_core *c, float phase);
 void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in);
 // FIFO entries per drain call of the drain thread, and per command while the ISR still pushes
 #define MCSA_DRAIN_BATCH		32
@@ -231,7 +230,6 @@ void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in);
 // Takes at most max_entries FIFO entries, and only those waiting at the call: the work per
 // call stays bounded while the ISR keeps pushing. Returns the number of entries taken.
 uint32_t mcsa_core_drain(mcsa_core *c, uint32_t max_entries);
-void mcsa_core_isr_end(mcsa_core *c, float isr_duration);
 mcsa_status mcsa_core_start(mcsa_core *c, const mcsa_env *env, uint8_t mode,
 		uint16_t mask, uint8_t R, uint32_t length, uint16_t token);
 void mcsa_core_stop(mcsa_core *c, mcsa_stop_reason reason);
@@ -253,6 +251,50 @@ static inline bool mcsa_core_running(const mcsa_core *c) {
 
 static inline bool mcsa_core_wants_sample(const mcsa_core *c) {
 	return c->state == MCSA_STATE_RUNNING && !c->isr_halt;
+}
+
+// Run in every FOC ISR, also without a capture: inline, so no call costs ISR time
+#define MCSA_ANGLE_UNITS_PER_RAD	(65536.0f / 6.28318530717958647692f)
+#define MCSA_IDLE_WINDOW			30000
+
+static inline void mcsa_core_update_angle(mcsa_core *c, float phase) {
+	// The comparison also rejects NaN
+	if (!(phase > -1000.0f && phase < 1000.0f)) {
+		return;
+	}
+
+	uint16_t frac = (uint16_t)(int32_t)(phase * MCSA_ANGLE_UNITS_PER_RAD);
+
+	if (c->theta_valid) {
+		c->theta += (int16_t)(uint16_t)(frac - c->frac_last);
+	} else {
+		c->theta = frac;
+		c->theta_valid = true;
+	}
+
+	c->frac_last = frac;
+}
+
+static inline void mcsa_core_isr_end(mcsa_core *c, float isr_duration) {
+	if (c->sampled_this_isr) {
+		c->sampled_this_isr = false;
+		if (isr_duration > c->isr_max_capture) {
+			c->isr_max_capture = isr_duration;
+		}
+		// Protects the motor control: one overlong ISR ends the capture
+		if (c->isr_limit > 0.0f && isr_duration > c->isr_limit) {
+			mcsa_core_stop(c, MCSA_STOP_ISR_OVERLOAD);
+		}
+	} else {
+		if (isr_duration > c->isr_max_idle_win) {
+			c->isr_max_idle_win = isr_duration;
+		}
+		if (++c->isr_idle_cnt >= MCSA_IDLE_WINDOW) {
+			c->isr_max_idle = c->isr_max_idle_win;
+			c->isr_max_idle_win = 0.0f;
+			c->isr_idle_cnt = 0;
+		}
+	}
 }
 
 #endif /* MCSA_CORE_H_ */

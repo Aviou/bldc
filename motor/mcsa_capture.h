@@ -89,6 +89,20 @@ bool mcsa_capture_sample_print_request(debug_sampling_mode mode);
 void mcsa_capture_config_changed(void);
 
 // Cycles of the whole ISR hook (angle, inputs, sample; DWT), shown by the terminal command mcsa_perf
-void mcsa_capture_perf_add(uint32_t cyc, bool output);
+typedef struct {
+	uint32_t count, max;
+	uint64_t sum;
+} mcsa_capture_perf_cat;
+
+extern volatile mcsa_capture_perf_cat mcsa_capture_perf[2];		// [0] without, [1] with an output value
+
+static inline void mcsa_capture_perf_add(uint32_t cyc, bool output) {
+	volatile mcsa_capture_perf_cat *p = &mcsa_capture_perf[output ? 1 : 0];
+	p->count++;
+	p->sum += cyc;
+	if (cyc > p->max) {
+		p->max = cyc;
+	}
+}
 
 #endif /* MCSA_CAPTURE_H_ */

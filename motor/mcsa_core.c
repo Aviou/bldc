@@ -21,17 +21,6 @@
 
 #include <string.h>
 
-#define TWO_PI_F				6.28318530717958647692f
-#define ANGLE_UNITS_PER_RAD		(65536.0f / TWO_PI_F)
-#define IDLE_WINDOW				30000
-
-// The hooks of the FOC ISR run from SRAM: no flash wait states, and they do not evict the
-// FOC code from the 1 KB flash cache (ART), which made the whole ISR slower under load.
-#if defined(__arm__)
-#define MCSA_RAMFUNC			__attribute__((section(".ramtext")))
-#else
-#define MCSA_RAMFUNC
-#endif
 
 static inline __attribute__((always_inline)) int32_t round_to_i32(float x) {
 	if (!(x == x)) {
@@ -208,24 +197,6 @@ void mcsa_core_init(mcsa_core *c, volatile int16_t *buf, uint32_t buf_bytes,
 	c->sp_valid = true;
 	c->state = MCSA_STATE_IDLE;
 	c->angle_pos = MCSA_ANGLE_NONE;
-}
-
-MCSA_RAMFUNC void mcsa_core_update_angle(mcsa_core *c, float phase) {
-	// The comparison also rejects NaN
-	if (!(phase > -1000.0f && phase < 1000.0f)) {
-		return;
-	}
-
-	uint16_t frac = (uint16_t)(int32_t)(phase * ANGLE_UNITS_PER_RAD);
-
-	if (c->theta_valid) {
-		c->theta += (int16_t)(uint16_t)(frac - c->frac_last);
-	} else {
-		c->theta = frac;
-		c->theta_valid = true;
-	}
-
-	c->frac_last = frac;
 }
 
 uint32_t mcsa_core_capacity(const mcsa_core *c, uint16_t mask) {
@@ -484,7 +455,7 @@ static void __attribute__((noinline)) sample_push(mcsa_core *c, const mcsa_sampl
 }
 
 // Hot path, every FOC cycle during a capture: only the integrators of the selected channels
-MCSA_RAMFUNC void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
+void mcsa_core_sample(mcsa_core *c, const mcsa_sample_in *in) {
 	if (!mcsa_core_wants_sample(c)) {
 		return;
 	}
@@ -648,28 +619,6 @@ uint32_t mcsa_core_drain(mcsa_core *c, uint32_t max_entries) {
 	}
 
 	return taken;
-}
-
-MCSA_RAMFUNC void mcsa_core_isr_end(mcsa_core *c, float isr_duration) {
-	if (c->sampled_this_isr) {
-		c->sampled_this_isr = false;
-		if (isr_duration > c->isr_max_capture) {
-			c->isr_max_capture = isr_duration;
-		}
-		// Protects the motor control: one overlong ISR ends the capture
-		if (c->isr_limit > 0.0f && isr_duration > c->isr_limit) {
-			mcsa_core_stop(c, MCSA_STOP_ISR_OVERLOAD);
-		}
-	} else {
-		if (isr_duration > c->isr_max_idle_win) {
-			c->isr_max_idle_win = isr_duration;
-		}
-		if (++c->isr_idle_cnt >= IDLE_WINDOW) {
-			c->isr_max_idle = c->isr_max_idle_win;
-			c->isr_max_idle_win = 0.0f;
-			c->isr_idle_cnt = 0;
-		}
-	}
 }
 
 uint32_t mcsa_core_max_records_per_read(uint32_t resp_max, uint8_t rec_bytes) {
