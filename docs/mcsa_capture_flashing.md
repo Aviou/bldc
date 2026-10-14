@@ -69,9 +69,13 @@ Im Folgenden steht `CLIENT` für alles bis einschließlich `mcsa_capture_client.
 4. **Offset-Prüfung im Stillstand:** `CLIENT /dev/ttyACM0 offset-check`. Erwartet: Rest-Offset je Kanal unter 1,5 Stufen; Exit-Code 1 bedeutet Warnung.
 5. **Einzelaufnahme im Stillstand:** `CLIENT /dev/ttyACM0 capture --decimation 10 --out /out/still_bridge`. Danach `status` ansehen: ISR-Maximum ohne und mit Aufnahme.
 6. **`COMM_SAMPLE_PRINT` nach einer MCSA-Aufnahme:** Schritt 3 wiederholen. Erwartet: funktioniert, denn eine neue Aufnahme übernimmt den Speicher.
-7. **Lauf mit Propeller** (12 000 ERPM, wie im Messbericht): Dafür muss ein Prozess den Motor drehen und zugleich aufnehmen. Der Client und `spin_capture.py` (motorpi) öffnen den Port jeweils exklusiv, und der Motor braucht alle 100 ms ein `COMM_SET_RPM` als Heartbeat, auch während eine Aufnahme läuft. **Das kombinierte Skript ist der nächste Schritt:** `spin_capture.py` ruft `McsaClient` über dieselbe serielle Verbindung auf und sendet zwischen den Anfragen weiter den Heartbeat. Bis dahin lässt sich nur im Stillstand messen.
+7. **Lauf mit Propeller** (12 000 ERPM, wie im Messbericht): Dafür muss ein Prozess den Motor drehen und zugleich aufnehmen. Der Client und `spin_capture.py` (motorpi) öffnen den Port jeweils exklusiv, und der Motor braucht alle 100 ms ein `COMM_SET_RPM` als Heartbeat, auch während eine Aufnahme läuft. Das übernimmt `spin_capture.py --mcsa` aus dem Repo `Aviou/motorpi`, Branch `feat/mcsa-spin-capture`, Ordner `scripts/mcsa` (dort auch eine Kopie dieses Clients). Es hält Heartbeat, Telemetrie und Abbruchprüfungen während jeder Anfrage aufrecht und gibt den Motor bei jedem Abbruch sofort frei:
 
-   Danach aufnehmen:
+   ```bash
+   python spin_capture.py /dev/ttyACM0 -1 12000 /out 5 --mcsa --mcsa-seconds=20
+   ```
+
+   Es prüft vor dem Anlaufen Firmware und Rest-Offset und nimmt bei Zieldrehzahl auf:
    - mit Standardmaske und R = 10
    - mit Maske 0x01FF (alle Kanäle, ISR-Last prüfen)
    - als Daueraufnahme über 20 s
@@ -95,7 +99,7 @@ Danach CAN-ID 3 und 4. Mit `bus_scan.py` (motorpi) prüfen, dass alle vier Contr
 
 Prüfungen über CAN:
 - **Einzelaufnahme im Stillstand:** `CLIENT /dev/ttyACM0 --can 3 capture --decimation 10 --out /out/m3_r10` wird lückenlos abgeholt, etwa 2–3 s.
-- **Daueraufnahme:** `CLIENT /dev/ttyACM0 --can 3 stream --decimation 20 --seconds 20 --out /out/m3_stream`, immer nur ein Knoten zur Zeit (im Stillstand sofort möglich, unter Last mit dem kombinierten Skript). Bei Lücken in der JSON-Datei R erhöhen oder Kanäle weglassen.
+- **Daueraufnahme:** `CLIENT /dev/ttyACM0 --can 3 stream --decimation 20 --seconds 20 --out /out/m3_stream`, immer nur ein Knoten zur Zeit (im Stillstand mit dem Client, unter Last mit `spin_capture.py --mcsa`). Bei Lücken in der JSON-Datei R erhöhen oder Kanäle weglassen.
 - **Dritter Kanal an Controller 3** (Offsetfehler, Messbericht Abschnitt 12): Einzelaufnahme mit `--mask 0x0187` im Stillstand (Rest-Offset je Kanal) und später unter Last, ic gegen ia und ib vergleichen.
 
 ## 6. Rückweg
