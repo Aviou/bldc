@@ -49,6 +49,15 @@ __attribute__((section(".ram4"), aligned(8))) volatile mcsa_shared_buffer mcsa_c
 __attribute__((section(".ram4"), aligned(4))) static volatile uint32_t m_fifo[MCSA_FIFO_WORDS];
 
 static THD_WORKING_AREA(drain_thread_wa, 512);
+
+// Under load the FOC ISR takes about 78 % of the CPU and the other NORMALPRIO threads share
+// the rest; in turn with them the drain fell behind. So every 0.5 ms it first takes up to
+// DRAIN_FIRST entries with priority over them (8 000 entries/s, enough for R >= 4), a short
+// piece of work that delays the others but never starves them. Whatever is still waiting
+// follows at NORMALPRIO in batches with chThdYield, like the other threads.
+#define DRAIN_PRIO			(NORMALPRIO + 1)
+#define DRAIN_FIRST			4
+
 static THD_FUNCTION(drain_thread, arg);
 
 mcsa_core mcsa_capture_core;
@@ -75,6 +84,7 @@ typedef struct {
 	uint64_t cyc;
 	uint32_t max_gap, max_fill;
 	uint32_t max_sleep, max_lock, max_call, min_one;
+	uint32_t first;				// Entries taken with priority (DRAIN_FIRST per wake-up)
 } drain_perf;
 
 static volatile drain_perf m_drain;
@@ -88,7 +98,7 @@ void mcsa_capture_init(void) {
 	chMtxObjectInit(&m_mutex);
 	mcsa_core_init(&mcsa_capture_core, mcsa_capture_shared.mcsa, MCSA_CAPTURE_BUF_BYTES,
 			m_fifo, sizeof(m_fifo));
-	chThdCreateStatic(drain_thread_wa, sizeof(drain_thread_wa), NORMALPRIO, drain_thread, NULL);
+	chThdCreateStatic(drain_thread_wa, sizeof(drain_thread_wa), DRAIN_PRIO, drain_thread, NULL);
 
 	// Cycle counter for mcsa_perf
 	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -133,12 +143,13 @@ static void terminal_perf(int argc, const char **argv) {
 	d.max_lock = m_drain.max_lock;
 	d.max_call = m_drain.max_call;
 	d.min_one = m_drain.min_one;
+	d.first = m_drain.first;
 	memset((void *)&m_drain, 0, sizeof(m_drain));
 	m_drain.min_one = UINT32_MAX;
 	chSysUnlock();
-	commands_printf("drain thread: %u wake-ups, %u entries, %.0f cyc per entry without FOC ISR, "
+	commands_printf("drain thread: %u wake-ups, %u entries (%u with priority), %.0f cyc per entry without FOC ISR, "
 			"max gap %.0f us, max fill %u of %u entries",
-			(unsigned)d.wakes, (unsigned)d.entries,
+			(unsigned)d.wakes, (unsigned)d.entries, (unsigned)d.first,
 			(double)(d.entries ? (float)d.cyc / (float)d.entries : 0.0f),
 			(double)((float)d.max_gap * us), (unsigned)d.max_fill,
 			(unsigned)mcsa_capture_core.fifo_slots);
@@ -172,6 +183,32 @@ void mcsa_capture_unlock(void) {
 	chMtxUnlock(&m_mutex);
 }
 
+// One drain call under the mutex, with the statistics for mcsa_perf
+static uint32_t drain_locked(mcsa_core *c, uint32_t max_entries) {
+	uint32_t l0 = DWT->CYCCNT;
+	mcsa_capture_lock();
+	uint32_t c0 = DWT->CYCCNT;
+	uint32_t i0 = mcsa_capture_isr_cyc;
+	uint32_t taken = mcsa_core_drain(c, max_entries);
+	uint32_t wall = DWT->CYCCNT - c0;
+	uint32_t isr = mcsa_capture_isr_cyc - i0;
+	mcsa_capture_unlock();
+	if (c0 - l0 > m_drain.max_lock) {
+		m_drain.max_lock = c0 - l0;
+	}
+	if (taken > 0) {
+		m_drain.entries += taken;
+		m_drain.cyc += wall > isr ? wall - isr : 0;
+		if (wall > m_drain.max_call) {
+			m_drain.max_call = wall;
+		}
+		if (taken == 1 && isr == 0 && wall < m_drain.min_one) {
+			m_drain.min_one = wall;
+		}
+	}
+	return taken;
+}
+
 static THD_FUNCTION(drain_thread, arg) {
 	(void)arg;
 	chRegSetThreadName("MCSA drain");
@@ -181,15 +218,14 @@ static THD_FUNCTION(drain_thread, arg) {
 
 	m_drain.min_one = UINT32_MAX;
 
-	// Batches of MCSA_DRAIN_BATCH keep the work per call bounded, and the thread yields between
-	// them, so the threads of the same priority (among them the watchdog thread) keep running
-	// even if the drain only just keeps up with the ISR.
 	for (;;) {
+		// Without a capture rarely: every wake-up costs other threads CPU time
+		bool active = c->state == MCSA_STATE_RUNNING || c->fifo_tail != c->fifo_head;
 		uint32_t s0 = DWT->CYCCNT;
-		chThdSleepMicroseconds(500);
+		chThdSleepMicroseconds(active ? 500 : 2000);
 
 		uint32_t now = DWT->CYCCNT;
-		if (now - s0 > m_drain.max_sleep) {
+		if (active && now - s0 > m_drain.max_sleep) {
 			m_drain.max_sleep = now - s0;
 		}
 		uint32_t head = c->fifo_head;
@@ -206,31 +242,16 @@ static THD_FUNCTION(drain_thread, arg) {
 		}
 		last = now;
 
-		uint32_t taken;
-		do {
-			uint32_t l0 = DWT->CYCCNT;
-			mcsa_capture_lock();
-			uint32_t c0 = DWT->CYCCNT;
-			uint32_t i0 = mcsa_capture_isr_cyc;
-			taken = mcsa_core_drain(c, MCSA_DRAIN_BATCH);
-			uint32_t wall = DWT->CYCCNT - c0;
-			uint32_t isr = mcsa_capture_isr_cyc - i0;
-			mcsa_capture_unlock();
-			if (c0 - l0 > m_drain.max_lock) {
-				m_drain.max_lock = c0 - l0;
-			}
-			if (taken > 0) {
-				m_drain.entries += taken;
-				m_drain.cyc += wall > isr ? wall - isr : 0;
-				if (wall > m_drain.max_call) {
-					m_drain.max_call = wall;
-				}
-				if (taken == 1 && isr == 0 && wall < m_drain.min_one) {
-					m_drain.min_one = wall;
-				}
-			}
-			chThdYield();
-		} while (taken == MCSA_DRAIN_BATCH);
+		uint32_t taken = drain_locked(c, DRAIN_FIRST);
+		m_drain.first += taken;
+		if (taken == DRAIN_FIRST) {
+			chThdSetPriority(NORMALPRIO);
+			do {
+				taken = drain_locked(c, MCSA_DRAIN_BATCH);
+				chThdYield();
+			} while (taken == MCSA_DRAIN_BATCH);
+			chThdSetPriority(DRAIN_PRIO);
+		}
 	}
 }
 

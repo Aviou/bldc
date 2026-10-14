@@ -534,7 +534,7 @@ uint32_t mcsa_core_drain(mcsa_core *c, uint32_t max_entries) {
 		// Only the entries of channels in the mask are written and read
 		int32_t y32[3];
 		int64_t y64[5];
-		uint16_t fl = 0;
+		uint16_t fl_out = 0;
 		for (int k = 0; k < 3; k++) {
 			if (mask & (1u << k)) {
 				y32[k] = comb32(*e++, c->cic32_comb[k]);
@@ -547,22 +547,21 @@ uint32_t mcsa_core_drain(mcsa_core *c, uint32_t max_entries) {
 				y64[j] = comb64(v, c->cic64_comb[j]);
 			}
 		}
-		if (mask & (1u << MCSA_CH_FLAGS)) {
-			fl = (uint16_t)*e++;
+		if (c->use_flags) {
+			// The filter spans the last MCSA_CIC_ORDER windows
+			c->flags_hist[0] = (uint16_t)*e++;
+			uint16_t hm = 0;
+			uint16_t run = MCSA_FLAG_RUNNING;
+			for (int w = 0; w < MCSA_CIC_ORDER; w++) {
+				hm |= c->flags_hist[w] & (MCSA_FLAG_HIGH_MOD_A | MCSA_FLAG_HIGH_MOD_B | MCSA_FLAG_HIGH_MOD_C);
+				run &= c->flags_hist[w];
+			}
+			for (int w = MCSA_CIC_ORDER - 1; w > 0; w--) {
+				c->flags_hist[w] = c->flags_hist[w - 1];
+			}
+			fl_out = (uint16_t)(hm | run);
 		}
 		c->fifo_tail = tail + 1 == c->fifo_slots ? 0 : tail + 1;
-
-		// The filter spans the last MCSA_CIC_ORDER windows
-		c->flags_hist[0] = fl;
-		uint16_t hm = 0;
-		uint16_t run = MCSA_FLAG_RUNNING;
-		for (int w = 0; w < MCSA_CIC_ORDER; w++) {
-			hm |= c->flags_hist[w] & (MCSA_FLAG_HIGH_MOD_A | MCSA_FLAG_HIGH_MOD_B | MCSA_FLAG_HIGH_MOD_C);
-			run &= c->flags_hist[w];
-		}
-		for (int w = MCSA_CIC_ORDER - 1; w > 0; w--) {
-			c->flags_hist[w] = c->flags_hist[w - 1];
-		}
 
 		if (++c->out_count <= MCSA_DROP_OUTPUTS) {
 			continue;
@@ -599,7 +598,7 @@ uint32_t mcsa_core_drain(mcsa_core *c, uint32_t max_entries) {
 			val[MCSA_CH_ANGLE] = (int16_t)(uint16_t)((uint64_t)q13 & 0xFFFFu);
 			c->last_angle_q13 = q13;
 		}
-		val[MCSA_CH_FLAGS] = (int16_t)(uint16_t)(hm | run);
+		val[MCSA_CH_FLAGS] = (int16_t)fl_out;
 
 		volatile int16_t *rec = c->buf + (c->n_written % c->capacity) * c->nch;
 		for (uint8_t i = 0; i < c->nch; i++) {
