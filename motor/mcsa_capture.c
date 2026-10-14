@@ -89,6 +89,7 @@ typedef struct {
 } drain_perf;
 
 static volatile drain_perf m_drain;
+static uint32_t m_perf_c0, m_perf_isr0;		// Cycle counter and ISR cycles at the last mcsa_perf
 volatile uint32_t mcsa_capture_isr_cyc;
 
 static void terminal_perf(int argc, const char **argv);
@@ -169,9 +170,17 @@ static void terminal_perf(int argc, const char **argv) {
 			(double)((float)d.max_gap * us), (unsigned)d.max_fill,
 			(unsigned)mcsa_capture_core.fifo_slots);
 	commands_printf("drain thread: max sleep %.0f us, max lock wait %.0f us, max call %.0f us, "
-			"single entry min %u cyc",
+			"single entry without ISR min %u cyc",
 			(double)((float)d.max_sleep * us), (double)((float)d.max_lock * us),
 			(double)((float)d.max_call * us), (unsigned)(d.min_one == UINT32_MAX ? 0 : d.min_one));
+	uint32_t c_now = DWT->CYCCNT;
+	uint32_t isr_now = mcsa_capture_isr_cyc;
+	if (m_perf_c0 != 0) {
+		commands_printf("FOC ISR load since the last call: %.1f %%",
+				(double)(100.0f * (float)(isr_now - m_perf_isr0) / (float)(c_now - m_perf_c0)));
+	}
+	m_perf_c0 = c_now;
+	m_perf_isr0 = isr_now;
 	commands_printf("ISR max with capture %.1f us, without %.1f us\n",
 			(double)(mcsa_capture_core.isr_max_capture * 1.0e6f),
 			(double)(mcsa_capture_core.isr_max_idle * 1.0e6f));
@@ -235,7 +244,7 @@ static THD_FUNCTION(drain_thread, arg) {
 				if (wall > m_drain.max_call) {
 					m_drain.max_call = wall;
 				}
-				if (taken == 1 && wall < m_drain.min_one) {
+				if (taken == 1 && isr == 0 && wall < m_drain.min_one) {
 					m_drain.min_one = wall;
 				}
 			}

@@ -63,6 +63,7 @@ static void terminal_plot_hfi(int argc, const char **argv);
 static void timer_update(motor_all_state_t *motor, float dt);
 static void input_current_offset_measurement( void );
 static void hfi_update(volatile motor_all_state_t *motor, float dt);
+static void adc_int_handler(void *p, uint32_t flags);
 
 // Threads
 static THD_WORKING_AREA(timer_thread_wa, 512);
@@ -2542,7 +2543,14 @@ void mcpwm_foc_tim_sample_int_handler(void) {
 	}
 }
 
+// MCSA: CPU cycles of every handler call (both halves of the PWM period), for mcsa_perf
 void mcpwm_foc_adc_int_handler(void *p, uint32_t flags) {
+	uint32_t c0 = DWT->CYCCNT;
+	adc_int_handler(p, flags);
+	mcsa_capture_isr_cyc += DWT->CYCCNT - c0;
+}
+
+static void adc_int_handler(void *p, uint32_t flags) {
 	(void)p;
 	(void)flags;
 
