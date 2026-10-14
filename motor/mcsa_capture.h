@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "hal.h"
 #include "datatypes.h"
 #include "mcsa_core.h"
 
@@ -71,7 +72,11 @@ static inline void mcsa_capture_isr_sample(const mcsa_sample_in *in) {
 	mcsa_core_sample(&mcsa_capture_core, in);
 }
 
+// Sum of all FOC ISR durations in CPU cycles (modular), for the drain cost in mcsa_perf
+extern volatile uint32_t mcsa_capture_isr_cyc;
+
 static inline void mcsa_capture_isr_end(float isr_duration) {
+	mcsa_capture_isr_cyc += (uint32_t)(isr_duration * (float)STM32_SYSCLK);
 	mcsa_core_isr_end(&mcsa_capture_core, isr_duration);
 }
 
