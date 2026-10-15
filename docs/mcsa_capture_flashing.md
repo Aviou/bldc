@@ -100,6 +100,8 @@ Im Folgenden steht `CLIENT` für alles bis einschließlich `mcsa_capture_client.
    - mit Maske 0x01FF (alle Kanäle, ISR-Last prüfen; im Stillstand erst ab R = 10 vollständig)
    - als Daueraufnahme über 20 s
 
+   Unter Last ist die CPU bei 30 kHz Regeltakt fast voll (FOC-Interrupt 78 %): Einzelaufnahmen mit Standardmaske gehen erst ab R = 20, Daueraufnahmen erst ab R = 50; darunter endet die Aufnahme sauber mit `FIFO_OVERRUN`. Ab 25 kHz Regeltakt (`foc_f_zv` 50 000) gehen auch Daueraufnahmen mit etwa 3 kHz. Gemessene Grenzen: Protokoll, Abschnitt Echtzeit. Grenzen eigener Konfigurationen misst `spin_capture.py --mcsa --mcsa-perf --mcsa-masks=…`.
+
    Kontrolle:
    - Der Kanal iq stimmt mit der Telemetrie überein.
    - Die 1000-Hz-Störlinie aus dem Messbericht ist verschwunden.

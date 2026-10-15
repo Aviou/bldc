@@ -269,6 +269,8 @@ Transport: `COMM_CUSTOM_APP_DATA` (= 36), über USB direkt oder per `COMM_FORWAR
 - **Priorität:** Der Thread lief zuerst mit `NORMALPRIO + 1` und leerte den FIFO „bis leer“. Bei R = 1 verhungerte so der Watchdog-Thread. Deshalb begrenzte Stapel und `NORMALPRIO`.
 - **Messwerte und tragfähige R je Maske:** `mcsa_capture_protocol.md`, Abschnitt Echtzeit.
 
+**Nachtrag 15.10.2026 (Läufe mit Propeller):** Unter Last belegt der FOC-Interrupt bei 30 kHz 78 % der CPU, frei sind 3–4 %. Umgesetzt: schlanker Hook (nur die gewählten Eingänge, seltene Teile ausgelagert, Winkelzähler inline; aus dem SRAM gemessen langsamer als aus dem Flash), `STATUS`/`READ` holen während der Aufnahme nichts ab, der Abhol-Thread wacht ohne Aufnahme nur alle 2 ms auf. Ein Vorrang für den Abhol-Thread (`NORMALPRIO + 1`) führte zum Watchdog-Neustart und ist wieder entfernt. Ergebnis: bei 30 kHz unter Last nur Einzelaufnahmen ab R = 20 mit Standardmaske; ab 25 kHz Regeltakt auch Daueraufnahmen mit etwa 3 kHz.
+
 ## 9. Host-Client `mcsa_client/mcsa_capture_client.py`
 
 - Abhängigkeiten: `pyserial`, `numpy`. Framing und CRC wie `scripts/mcsa/vesc_sampleprint.py` (motorpi).
@@ -319,3 +321,4 @@ Reihenfolge und Prüfschritte stehen in `docs/mcsa_capture_flashing.md`. Kurz:
 - 2026-10-13, Umsetzung: Client liegt in `mcsa_client/` statt `tools/`, weil `tools/` im bldc-Repo der (ignorierte) Toolchain-Ordner von `make arm_sdk_install` ist.
 - 2026-10-13, Abschluss-Review (Claude Opus + Codex): Sample-Print-Übernahme löscht MCSA-Daten; Stoppgrund `ANGLE_STEP`; Konfigurationshook auch am Ende; Client verwirft veraltete `READ`-Antworten, bricht bei Reboot ab (Tick-Überlauf ausgenommen), stoppt bei Abbruch, erkennt Token-Kollisionen, schreibt den Winkel exakt; `offsetof`-Asserts.
 - 2026-10-14, Messungen an der Bridge: ISR/Thread-Aufteilung mit FIFO, Stoppgründe `ISR_OVERLOAD` und `FIFO_OVERRUN`, Terminalbefehl `mcsa_perf`; Nachtrag in Abschnitt 8.
+- 2026-10-15, Läufe mit Propeller: schlanker Hook, kein Abholen in `STATUS`/`READ` während der Aufnahme, kein Vorrang für den Abhol-Thread (Watchdog-Neustart mit `a859fdc7`); Grenzen bei 30/25/20 kHz Regeltakt; Nachtrag in Abschnitt 8.

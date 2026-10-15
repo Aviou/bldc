@@ -254,26 +254,38 @@ Eine Konfigurationsänderung (`mc_interface_set_configuration`, zum Beispiel dur
 ## Echtzeit
 
 **Aufteilung:**
-- **FOC-Interrupt:** führt in jedem Durchlauf den Umdrehungszähler (etwa 90 Zyklen, auch ohne Aufnahme). Während einer Aufnahme rechnet er nur die Integratoren des CIC-Filters. Alle R Durchläufe legt er deren letzte Stufe in einen FIFO (1 792 Byte im CCM; je nach Maske 32 bis 448 Einträge).
-- **Abhol-Thread** (`MCSA drain`, gleiche Priorität wie der Watchdog-Thread): wacht alle 0,5 ms auf und rechnet Kämme, Normierung und Datensätze. Er arbeitet in Stapeln zu 32 Einträgen und gibt dazwischen die CPU ab. `STATUS`, `READ` und `STOP` holen vorher ebenfalls ab.
+- **FOC-Interrupt:** führt in jedem Durchlauf den Umdrehungszähler (inline, auch ohne Aufnahme). Während einer Aufnahme rechnet er nur die Integratoren der gewählten Kanäle; Ströme und Offsets liest er per Zeiger, id/iq/vd/vq und die Timer-Register nur, wenn die Maske sie enthält. Alle R Durchläufe legt er die letzte Integratorstufe in einen FIFO (1 792 Byte im CCM; je nach Maske 32 bis 448 Einträge).
+- **Abhol-Thread** (`MCSA drain`, `NORMALPRIO` wie der Watchdog-Thread): wacht während einer Aufnahme alle 0,5 ms auf, sonst alle 2 ms. Er rechnet Kämme, Normierung und Datensätze in Stapeln zu 8 Einträgen und gibt dazwischen die CPU ab.
+- **`STATUS` und `READ`** holen während einer Aufnahme nichts selbst ab (unter Last hielt schon ein Stapel den Mutex für Dutzende Millisekunden). Ist die Aufnahme beendet, holen sie alles Wartende, `n_written` ist dann endgültig. `STOP` holt immer alles.
 
 **Schutz:**
 - **`ISR_OVERLOAD`:** Ein FOC-Durchlauf mit Aufnahme über 90 % seines Zyklus (30 µs bei 30 kHz) beendet die Aufnahme.
-- **`FIFO_OVERRUN`:** Kommt das Abholen nicht hinterher, endet die Aufnahme. Die Datensätze bis dahin bleiben lesbar. Zu viel Last führt so nie zu einem Watchdog-Neustart.
+- **`FIFO_OVERRUN`:** Kommt das Abholen nicht hinterher, endet die Aufnahme. Die Datensätze bis dahin bleiben lesbar.
+- **Kein Vorrang für den Abhol-Thread.** Ein Versuch mit `NORMALPRIO + 1` (höchstens 4 Einträge je 0,5 ms) führte unter Last zu einem Watchdog-Neustart: Unter Last kostet ein Eintrag etwa 7 400 Zyklen statt 1 500 im Stillstand, das war mehr CPU, als allen Threads blieb (Bridge, 15.10.2026, FW `a859fdc7`).
 
-**Gemessen an der Bridge im Stillstand** (FW `9dd573db`, 14.10.2026):
+**Stillstand** (Bridge, FW `6762899d`, Regeltakt 30 kHz):
 
 | | Standardmaske 0x0087 | alle Kanäle 0x01FF | ein Kanal 0x0001 |
 |---|---|---|---|
-| Interrupt-Anteil je Durchlauf ohne / mit Ausgabewert | 1,65 / 2,6 µs | 4,5 / 5,6 µs | – / 2,0 µs (R = 1) |
-| FOC-Durchlauf max. ohne / mit Aufnahme | 17,4 / 20,9 µs | 17,4 / 23,9 µs | 17,4 / 20,4–21,3 µs |
+| ganzer Hook je Durchlauf ohne / mit Ausgabewert (Mittel) | 1,9 / 3,0 µs | 5,2 / 6,3 µs | 1,5 / 2,5 µs |
+| FOC-Durchlauf max. ohne / mit Aufnahme | 17,1 / 19,8 µs | 17,1 / 23,1 µs | 17,1 / 19,4 µs |
 | Abholen je Eintrag, rein (Interrupts gesperrt) | ≈ 1 140 Zyklen | ≈ 2 500 Zyklen | – |
-| Abholen je Eintrag im Betrieb, ohne FOC-Interrupt | ≈ 1 900–2 800 Zyklen | ≈ 8 000–11 000 Zyklen | ≈ 1 100–1 500 Zyklen |
-| Einzelaufnahme vollständig ab | R = 2 | R = 10 | R = 1 |
-| Daueraufnahme über USB lückenlos ab | R = 10 | R = 20 | R = 2 |
+| Einzelaufnahme vollständig | ab R = 2 | ab R = 10 | ab R = 1 |
+| Daueraufnahme über USB lückenlos | ab R = 10 | ab R = 20 | ab R = 2 |
 
-Darunter endet die Aufnahme mit `FIFO_OVERRUN` (bzw. bei der Daueraufnahme mit Standardmaske und R = 5 mit Lücken durch USB). Der FOC-Interrupt belegt im Stillstand 56 % der CPU, mit Aufnahme 59–62 %. Unter Last steigt er, die Grenzen verschieben sich dann zu größerem R.
+Der FOC-Interrupt belegt im Stillstand 55 % der CPU.
+
+**Unter Last** (Bridge mit Propeller, etwa 17 300–18 000 ERPM, 20–25 A, 15.10.2026, FW `6762899d`). Der FOC-Interrupt allein belegt bei 30 kHz Regeltakt 78 % der CPU, der längste Durchlauf dauert 25 µs; frei sind nur noch 3–4 %. Je Konfiguration eine Einzelaufnahme (3 000 Datensätze bzw. ganzer Puffer) und eine Daueraufnahme über 5 s:
+
+| Regeltakt (`foc_f_zv`) | FOC-Last | Einzelaufnahme vollständig | Daueraufnahme lückenlos |
+|---|---|---|---|
+| 30 kHz (60 000) | 78 % | ia ab R = 10, ia + Winkel ab R = 15, Standardmaske ab R = 20 | ia ab R = 20, Standardmaske erst bei R = 50 |
+| 25 kHz (50 000) | 66 % | Standardmaske R = 8 (3 125 Hz), alle Kanäle R = 12 | Standardmaske R = 8, ia + Winkel R = 8, ia R = 5; alle Kanäle R = 12 nicht |
+| 20 kHz (40 000) | 52 % | alles Getestete, auch alle Kanäle R = 10 | Standardmaske R = 5 (4 kHz), alle Kanäle R = 10 |
+
+Darunter endet die Aufnahme mit `FIFO_OVERRUN`, ohne Neustart und ohne Fehlercode. Der längste FOC-Durchlauf mit Aufnahme liegt bei allen drei Regeltakten bei 27–31 µs, die Schutzgrenze bei 90 % der jeweiligen Periode (30 / 36 / 45 µs). Für MCSA unter Last mit Standardmaske und etwa 3 kHz Ausgaberate reicht also 25 kHz Regeltakt; bei 30 kHz nur Einzelaufnahmen ab R = 20 (1,5 kHz).
 
 **Messen:**
 - `STATUS` meldet die ISR-Maxima mit und ohne Aufnahme.
-- Der Terminalbefehl `mcsa_perf` (VESC Tool oder `term_cmd.py PORT -1 mcsa_perf` aus motorpi `scripts/mcsa`) zeigt seit dem letzten Aufruf: Zyklen des Interrupt-Anteils, Kosten und Pausen des Abhol-Threads, höchsten FIFO-Füllstand und die Last des FOC-Interrupts (bei Abständen unter 20 s). Danach setzt er die Werte zurück.
+- Der Terminalbefehl `mcsa_perf` (VESC Tool oder `term_cmd.py PORT -1 mcsa_perf` aus motorpi `scripts/mcsa`) zeigt seit dem letzten Aufruf: Zyklen des ganzen Hooks, Kosten und Pausen des Abhol-Threads, höchsten FIFO-Füllstand und die Last des FOC-Interrupts (bei Abständen unter 20 s). Danach setzt er die Werte zurück.
+- Unter Last: `spin_capture.py --mcsa --mcsa-perf [--mcsa-masks=0x0087:8,...]` (motorpi `scripts/mcsa`) fragt `mcsa_perf` und die Thread-Statistik während des Laufs über dieselbe Verbindung ab.
