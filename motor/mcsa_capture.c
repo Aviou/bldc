@@ -50,18 +50,14 @@ __attribute__((section(".ram4"), aligned(4))) static volatile uint32_t m_fifo[MC
 
 static THD_WORKING_AREA(drain_thread_wa, 512);
 
-// Under load the FOC ISR takes about 78 % of the CPU and the other NORMALPRIO threads share
-// the rest; in turn with them the drain fell behind. So during a capture it takes up to
-// DRAIN_FIRST entries every 0.5 ms with priority over them (8 000 entries/s, enough for
-// R >= 4), a short piece of work that delays the others but never starves them. If more is
-// waiting, one more piece of DRAIN_MORE at NORMALPRIO (with spare CPU at standstill up to
-// 24 000 entries/s in total); it stays small, so the next prioritized wake-up is on time
-// even when that piece gets little CPU under load.
-// Without a capture it runs at NORMALPRIO: woken with priority at the systick, which is locked
-// to the PWM, it made the longest FOC ISR about 2 us longer (measured at standstill).
-#define DRAIN_PRIO			(NORMALPRIO + 1)
-#define DRAIN_FIRST			4
-#define DRAIN_MORE			8
+// The drain runs at NORMALPRIO in small batches and yields between them, so the other threads
+// of that priority (among them the watchdog thread) always get their turn. No priority above
+// them: under load (FOC ISR 78 %) an entry costs about 7 400 cycles instead of 1 500 at
+// standstill (cold cache, 7 us between two ISRs); with only 4 entries per 0.5 ms at
+// NORMALPRIO + 1 that was more CPU than all threads had left, and the watchdog reset the MCU
+// (bridge, 2026-10-15, a859fdc7). If the drain falls behind, the capture ends with
+// FIFO_OVERRUN instead.
+#define DRAIN_BATCH			8
 
 static THD_FUNCTION(drain_thread, arg);
 
@@ -89,7 +85,6 @@ typedef struct {
 	uint64_t cyc;
 	uint32_t max_gap, max_fill;
 	uint32_t max_sleep, max_lock, max_call, min_one;
-	uint32_t first;				// Entries taken with priority (DRAIN_FIRST per wake-up)
 } drain_perf;
 
 static volatile drain_perf m_drain;
@@ -148,13 +143,12 @@ static void terminal_perf(int argc, const char **argv) {
 	d.max_lock = m_drain.max_lock;
 	d.max_call = m_drain.max_call;
 	d.min_one = m_drain.min_one;
-	d.first = m_drain.first;
 	memset((void *)&m_drain, 0, sizeof(m_drain));
 	m_drain.min_one = UINT32_MAX;
 	chSysUnlock();
-	commands_printf("drain thread: %u wake-ups, %u entries (%u with priority), %.0f cyc per entry without FOC ISR, "
+	commands_printf("drain thread: %u wake-ups, %u entries, %.0f cyc per entry without FOC ISR, "
 			"max gap %.0f us, max fill %u of %u entries",
-			(unsigned)d.wakes, (unsigned)d.entries, (unsigned)d.first,
+			(unsigned)d.wakes, (unsigned)d.entries,
 			(double)(d.entries ? (float)d.cyc / (float)d.entries : 0.0f),
 			(double)((float)d.max_gap * us), (unsigned)d.max_fill,
 			(unsigned)mcsa_capture_core.fifo_slots);
@@ -226,7 +220,6 @@ static THD_FUNCTION(drain_thread, arg) {
 	for (;;) {
 		// Without a capture rarely: every wake-up costs other threads CPU time
 		bool active = c->state == MCSA_STATE_RUNNING || c->fifo_tail != c->fifo_head;
-		chThdSetPriority(active ? DRAIN_PRIO : NORMALPRIO);
 		uint32_t s0 = DWT->CYCCNT;
 		chThdSleepMicroseconds(active ? 500 : 2000);
 
@@ -248,14 +241,11 @@ static THD_FUNCTION(drain_thread, arg) {
 		}
 		last = now;
 
-		uint32_t taken = drain_locked(c, DRAIN_FIRST);
-		if (active) {
-			m_drain.first += taken;
-		}
-		if (taken == DRAIN_FIRST) {
-			chThdSetPriority(NORMALPRIO);
-			drain_locked(c, DRAIN_MORE);
-		}
+		uint32_t taken;
+		do {
+			taken = drain_locked(c, DRAIN_BATCH);
+			chThdYield();
+		} while (taken == DRAIN_BATCH);
 	}
 }
 
